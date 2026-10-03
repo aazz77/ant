@@ -65,6 +65,9 @@ hmac = "0.12"
 sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
+# TUN virtual NIC (Linux + Windows via WinTun). async = AsyncDevice.
+tun = { version = "0.8", features = ["async"] }
+
 # Linux/Android-only: transparent proxy inbounds (tproxy / redir) use netfilter
 # sockopts via libc; etherparse is for raw-packet re-injection in tproxy.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
