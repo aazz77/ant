@@ -41,7 +41,7 @@ pub async fn run_redir(
                         let router = router.clone();
                         let outbounds = outbounds.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_redir(stream, peer, router, outbounds).await {
+                            if let Err(e) = handle_connection(stream, peer, router, outbounds).await {
                                 tracing::debug!("redir {peer}: {e:#}");
                             }
                         });
@@ -58,7 +58,8 @@ pub async fn run_redir(
     Ok(())
 }
 
-async fn handle_redir(
+/// Shared by the public `redir-port` inbound and TUN `auto-redirect`.
+pub(crate) async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     router: Arc<Router>,
