@@ -56,8 +56,9 @@ pub struct TunConfig {
     /// Windows: best-effort (mark/route still required for full isolation).
     #[serde(default, rename = "auto-detect-interface")]
     pub auto_detect_interface: bool,
-    /// Linux only: install nftables/iptables REDIRECT rules to `redir-port`.
-    /// Requires `redir-port` > 0. Ignored on non-Linux.
+    /// Linux only: install nftables/iptables REDIRECT for TCP onto an *internal*
+    /// listener (mihomo-style). Does **not** require `redir-port`. UDP still
+    /// goes through TUN via auto-route. Ignored on non-Linux.
     #[serde(default, rename = "auto-redirect")]
     pub auto_redirect: bool,
     /// Stronger anti-leak routing on top of auto-route (Linux). May break LAN reachability.
@@ -128,6 +129,8 @@ pub struct GlobalConfig {
         allow(dead_code)
     )]
     pub redir_port: u16,
+    /// SO_MARK for outbound sockets (anti-loop with TUN auto-route).
+    /// If 0 and TUN auto-route/redirect/detect-interface is on, a default (255) is applied at runtime.
     #[serde(default, rename = "mark")]
     pub mark: u32,
     #[serde(default = "default_bind", rename = "bind-address")]
