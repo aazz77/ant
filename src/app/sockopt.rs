@@ -40,6 +40,22 @@ fn apply_mark(sock: &Socket) {
     let _ = sock;
 }
 
+fn apply_bind_iface(sock: &Socket) {
+    // SO_BINDTODEVICE: force outbound onto the physical default interface so
+    // packets do not re-enter TUN when auto-route is on.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if let Some(name) = crate::tun::iface::bind_interface() {
+            // socket2 0.5: bind_device takes Option<&[u8]>
+            if let Err(e) = sock.bind_device(Some(name.as_bytes())) {
+                tracing::warn!("SO_BINDTODEVICE {name}: {e}");
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = sock;
+}
+
 /// `::` (or empty) is a single dual-stack IPv6 socket (IPV6_V6ONLY=0) that
 /// accepts both IPv4 and IPv6, so it is bound exactly once; binding `0.0.0.0`
 /// as well would make the `[::]` bind fail with EADDRINUSE.
@@ -150,6 +166,7 @@ pub async fn connect_tcp(addr: SocketAddr) -> Result<TcpStream> {
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::STREAM, None).context("tcp socket")?;
     apply_mark(&sock);
+    apply_bind_iface(&sock);
     sock.set_nonblocking(true)?;
     match sock.connect(&addr.into()) {
         Ok(()) => {}
@@ -171,6 +188,7 @@ pub async fn bind_udp(bind: SocketAddr) -> Result<UdpSocket> {
     let domain = if bind.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::DGRAM, None).context("udp socket")?;
     apply_mark(&sock);
+    apply_bind_iface(&sock);
     sock.set_nonblocking(true)?;
     sock.bind(&bind.into()).context("udp bind")?;
     let std: StdUdp = sock.into();
