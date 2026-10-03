@@ -103,7 +103,7 @@ impl IpDefragmenter {
         // R4：RFC 791 要求非末片载荷长度必须为 8 字节对齐（分片偏移以 8 字节
         // 为单位），否则无法保证后续分片无重叠/空洞。旧实现未校验，恶意
         // 构造的非对齐分片可导致错误重组。直接丢弃该分片（条目超时回收）。
-        if more_fragments && payload.len() % 8 != 0 {
+        if more_fragments && !payload.len().is_multiple_of(8) {
             return None;
         }
         let frag_data = payload;

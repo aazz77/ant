@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 
 // ── 常量（对齐 sing-tun tun_offload_linux.go）─────────────────────────────────
@@ -153,7 +154,7 @@ pub struct GsoOptions {
 }
 
 impl VirtioNetHdr {
-    pub fn to_gso_options(&self) -> std::io::Result<GsoOptions> {
+    pub fn to_gso_options(self) -> std::io::Result<GsoOptions> {
         let gso_type = match self.gso_type {
             VIRTIO_NET_HDR_GSO_NONE => GsoType::None,
             VIRTIO_NET_HDR_GSO_TCPV4 => GsoType::TcpV4,
@@ -756,7 +757,7 @@ fn tcp_packets_can_coalesce(
             return CanCoalesce::Unavailable;
         }
         if !(pkt_target.len() - iph_len as usize - tcph_len as usize)
-            % (item.gso_size as usize) == 0
+            .is_multiple_of(item.gso_size as usize)
         {
             return CanCoalesce::Unavailable;
         }
@@ -794,7 +795,7 @@ fn udp_packets_can_coalesce(
     if !ip_headers_can_coalesce(_pkt, pkt_target) {
         return CanCoalesce::Unavailable;
     }
-    if !(pkt_target.len() - iph_len as usize - UDP_HDR_LEN)% (item.gso_size as usize) == 0 {
+    if !(pkt_target.len() - iph_len as usize - UDP_HDR_LEN).is_multiple_of(item.gso_size as usize) {
         return CanCoalesce::Unavailable;
     }
     if gso_size > item.gso_size {

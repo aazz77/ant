@@ -38,8 +38,6 @@ type UdpPacket = (Bytes, SocketAddr);
 struct UdpEntry {
     packet_tx: mpsc::Sender<UdpPacket>,
     last_seen: Instant,
-    /// IP+UDP header template from the first request packet.
-    template: Vec<u8>,
 }
 
 pub struct StackAddrs {
@@ -589,7 +587,6 @@ async fn feed_udp(
         UdpEntry {
             packet_tx: tx,
             last_seen: Instant::now(),
-            template: template.clone(),
         },
     );
     drop(map);
