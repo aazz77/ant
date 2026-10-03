@@ -1,14 +1,14 @@
-//! TUN inbound (system stack only).
+//! TUN inbound (system stack).
 //!
-//! Creates a virtual NIC via the `tun` crate, runs a kernel-assisted system
-//! stack (TCP NAT + UDP sessions). Does **not** install routes (no auto_route)
-//! and does **not** hijack DNS.
+//! Creates a virtual NIC, optionally installs auto-route / auto-redirect /
+//! auto-detect-interface, runs the system stack with optional dns-hijack.
 //!
 //! Platforms: Linux + Windows. Address configuration uses `ip` (Linux) or
 //! `netsh` (Windows).
 
 mod device;
 mod gso;
+mod iface;
 mod ip_defrag;
 mod nat;
 mod native_tun;
@@ -16,10 +16,16 @@ mod native_tun;
 mod icmp_forwarder;
 mod offload;
 mod packet;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod redirect;
+mod route;
 mod stack;
 
+pub use iface::{bind_interface, detect_default_interface};
+
 use crate::app::router::Router;
-use crate::config::TunConfig;
+use crate::config::Config;
+use crate::dns;
 use crate::outbound::OutboundManager;
 use anyhow::{bail, Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -28,77 +34,110 @@ use tracing::{info, warn};
 
 /// Entry point used by `main`.
 pub async fn run_tun(
-    cfg: TunConfig,
+    cfg: Arc<Config>,
     router: Arc<Router>,
     outbounds: Arc<OutboundManager>,
 ) -> Result<()> {
-    if !cfg.enable {
-        bail!("tun disabled");
-    }
-    if cfg.address.is_empty() {
-        bail!("tun.address is required (e.g. [\"198.18.0.1/30\"])");
+    let tun_cfg = cfg.tun.clone();
+    if !tun_cfg.enable {
+        return Ok(());
     }
 
-    // Parse prefixes and derive server/client addresses (sing-tun / system stack).
-    let mut inet4_server: Option<Ipv4Addr> = None;
-    let mut inet4_client: Option<Ipv4Addr> = None;
-    let mut inet6_server: Option<Ipv6Addr> = None;
-    let mut inet6_client: Option<Ipv6Addr> = None;
-    let mut prefixes_v4: Vec<(Ipv4Addr, u8)> = Vec::new();
-    let mut prefixes_v6: Vec<(Ipv6Addr, u8)> = Vec::new();
+    let (dev, if_name) = device::create_device(&tun_cfg)
+        .await
+        .context("create TUN device")?;
 
-    for s in &cfg.address {
-        let (ip, pl) = parse_addr_prefix(s)
-            .with_context(|| format!("invalid tun.address entry: {s}"))?;
+    // Address assignment (side-effect on the OS interface).
+    let mut inet4_server = None;
+    let mut inet4_client = None;
+    let mut inet6_server = None;
+    let mut inet6_client = None;
+    let mut prefixes_v4 = Vec::new();
+    let mut v4_list = Vec::new();
+    let mut v6_list = Vec::new();
+
+    let addrs = if tun_cfg.address.is_empty() {
+        // Default pair used by many clients.
+        vec!["198.18.0.1/30".to_string()]
+    } else {
+        tun_cfg.address.clone()
+    };
+
+    for a in &addrs {
+        let (ip, pl) = parse_addr_prefix(a)?;
         match ip {
             IpAddr::V4(v4) => {
-                prefixes_v4.push((v4, pl));
-                if inet4_server.is_none() {
-                    if !has_next_addr_v4(v4, pl) {
-                        bail!(
-                            "tun: first IPv4 address {v4}/{pl} has no next address in prefix \
-                             (system stack needs server=addr, client=addr+1; use e.g. /30)"
-                        );
-                    }
-                    inet4_server = Some(v4);
-                    inet4_client = Some(next_v4(v4));
+                if !has_next_addr_v4(v4, pl) {
+                    bail!("tun address {a}: need room for addr+1 (avoid /32)");
                 }
+                let client = next_v4(v4);
+                if inet4_server.is_none() {
+                    inet4_server = Some(v4);
+                    inet4_client = Some(client);
+                }
+                prefixes_v4.push((v4, pl));
+                v4_list.push((v4, pl));
             }
             IpAddr::V6(v6) => {
-                prefixes_v6.push((v6, pl));
-                if inet6_server.is_none() {
-                    if !has_next_addr_v6(v6, pl) {
-                        bail!(
-                            "tun: first IPv6 address {v6}/{pl} has no next address in prefix \
-                             (system stack needs server=addr, client=addr+1)"
-                        );
-                    }
-                    inet6_server = Some(v6);
-                    inet6_client = Some(next_v6(v6));
+                if !has_next_addr_v6(v6, pl) {
+                    bail!("tun address {a}: need room for addr+1 (avoid /128)");
                 }
+                let client = next_v6(v6);
+                if inet6_server.is_none() {
+                    inet6_server = Some(v6);
+                    inet6_client = Some(client);
+                }
+                v6_list.push((v6, pl));
             }
         }
     }
 
-    if inet4_server.is_none() && inet6_server.is_none() {
-        bail!("tun.address must contain at least one IPv4 or IPv6 prefix");
-    }
+    device::configure_addresses(&if_name, &tun_cfg, &v4_list, &v6_list)
+        .await
+        .context("configure TUN addresses")?;
 
     info!(
-        device = ?cfg.device,
-        mtu = cfg.mtu,
-        v4_server = ?inet4_server,
-        v4_client = ?inet4_client,
-        v6_server = ?inet6_server,
-        v6_client = ?inet6_client,
-        "tun: starting system stack (no auto_route, no dns hijack)"
+        interface = %if_name,
+        mtu = tun_cfg.mtu,
+        v4 = ?inet4_server,
+        v6 = ?inet6_server,
+        "tun: device ready"
     );
 
-    let (dev, if_name) = device::create_device(&cfg).await?;
-    info!(interface = %if_name, "tun: device ready");
+    // auto-detect-interface: bind outbound to physical default NIC.
+    if tun_cfg.auto_detect_interface {
+        iface::start_monitor(if_name.clone(), true);
+    }
 
-    // Configure addresses / MTU via platform tools (no routes).
-    device::configure_addresses(&if_name, &cfg, &prefixes_v4, &prefixes_v6).await?;
+    // auto-route / strict-route
+    let _route_guard = if tun_cfg.auto_route {
+        Some(
+            route::install_routes(&if_name, &tun_cfg, cfg.global.mark)
+                .context("auto-route")?,
+        )
+    } else {
+        None
+    };
+
+    // auto-redirect (Linux only)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _redirect_guard = if tun_cfg.auto_redirect {
+        match redirect::install_redirect(cfg.global.redir_port, cfg.global.mark) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                warn!("tun: auto-redirect skipped: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _redirect_guard = {
+        if tun_cfg.auto_redirect {
+            warn!("tun: auto-redirect is Linux-only; ignored");
+        }
+    };
 
     // Linux: probe IFF_VNET_HDR + TUNSETOFFLOAD for GSO/GRO.
     let (vnet_hdr, gro_flags) = {
@@ -123,20 +162,31 @@ pub async fn run_tun(
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
-            // WinTun: pure IP frames (no kernel virtio_net_hdr / TUNSETOFFLOAD).
-            // Userspace GRO on the write path is still enabled inside NativeTunWriter.
             info!("tun: Windows/WinTun path — userspace GRO on write, no kernel vnet_hdr/GSO");
             (false, gso::GroDisablementFlags::default())
         }
     };
 
+    // DNS hijack context
+    let dns_hijack = stack::parse_dns_hijack(&tun_cfg.dns_hijack);
+    let (dns_direct, dns_proxy) = if dns_hijack.is_empty() {
+        (None, None)
+    } else {
+        let d = dns::parse_nameserver(&cfg.dns.direct_nameserver)
+            .context("tun dns-hijack: direct-nameserver")?;
+        let p = dns::parse_nameserver(&cfg.dns.proxy_nameserver)
+            .context("tun dns-hijack: proxy-nameserver")?;
+        (Some(Arc::new(d)), Some(Arc::new(p)))
+    };
+
     // Brief wait so the OS registers the address before we bind listeners.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    stack::run_system_stack(stack::TunStackParams {
+    // Keep route/redirect guards alive for the lifetime of the stack.
+    let result = stack::run_system_stack(stack::TunStackParams {
         dev,
         if_name,
-        cfg,
+        cfg: tun_cfg,
         addrs: stack::StackAddrs {
             inet4_server,
             inet4_client,
@@ -148,8 +198,17 @@ pub async fn run_tun(
         outbounds,
         vnet_hdr,
         gro_flags,
+        dns_hijack,
+        dns_direct,
+        dns_proxy,
     })
-    .await
+    .await;
+
+    // Explicit drop order: stack ends first, then guards clean up.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    drop(_redirect_guard);
+    drop(_route_guard);
+    result
 }
 
 fn parse_addr_prefix(s: &str) -> Result<(IpAddr, u8)> {
@@ -199,9 +258,4 @@ fn has_next_addr_v6(ip: Ipv6Addr, pl: u8) -> bool {
         !((1u128 << (128 - pl.min(128))) - 1)
     };
     (cur & mask) == (next & mask)
-}
-
-#[allow(dead_code)]
-fn warn_once(msg: &str) {
-    warn!("{msg}");
 }

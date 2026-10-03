@@ -16,8 +16,11 @@ use super::packet::{build_icmp_echo_reply_v4, build_icmp_echo_reply_v6};
 use crate::app::router::{Outbound, Router};
 use crate::app::stats;
 use crate::config::TunConfig;
+use crate::dns;
+use crate::dns::DnsUpstream;
 use crate::inbound::target;
 use crate::outbound::{relay, OutboundManager};
+use super::packet::build_udp_reply;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -67,6 +70,56 @@ struct StackRuntime {
     tcp_mss: Option<u16>,
     #[cfg(unix)]
     icmp: Option<Arc<super::icmp_forwarder::IcmpForwarder>>,
+    /// Parsed dns-hijack rules; empty = disabled.
+    dns_hijack: Arc<Vec<DnsHijackRule>>,
+    dns_direct: Option<Arc<DnsUpstream>>,
+    dns_proxy: Option<Arc<DnsUpstream>>,
+}
+
+/// One `dns-hijack` entry: optional IP filter + port (usually 53).
+#[derive(Clone, Debug)]
+pub struct DnsHijackRule {
+    /// None / unspecified = match any address on this port.
+    pub addr: Option<std::net::IpAddr>,
+    pub port: u16,
+}
+
+impl DnsHijackRule {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let s = s.strip_prefix("udp://").or_else(|| s.strip_prefix("tcp://")).unwrap_or(s);
+        let (host, port_s) = if let Some((h, p)) = s.rsplit_once(':') {
+            (h, p)
+        } else {
+            (s, "53")
+        };
+        let port: u16 = port_s.parse().ok()?;
+        let host = host.trim_matches(|c| c == '[' || c == ']');
+        let addr = if host.eq_ignore_ascii_case("any")
+            || host == "0.0.0.0"
+            || host == "::"
+            || host.is_empty()
+        {
+            None
+        } else {
+            Some(host.parse().ok()?)
+        };
+        Some(Self { addr, port })
+    }
+
+    pub fn matches(&self, dst: SocketAddr) -> bool {
+        if dst.port() != self.port {
+            return false;
+        }
+        match self.addr {
+            None => true,
+            Some(a) => a == dst.ip(),
+        }
+    }
+}
+
+pub fn parse_dns_hijack(list: &[String]) -> Vec<DnsHijackRule> {
+    list.iter().filter_map(|s| DnsHijackRule::parse(s)).collect()
 }
 
 pub struct TunStackParams {
@@ -78,6 +131,9 @@ pub struct TunStackParams {
     pub outbounds: Arc<OutboundManager>,
     pub vnet_hdr: bool,
     pub gro_flags: GroDisablementFlags,
+    pub dns_hijack: Vec<DnsHijackRule>,
+    pub dns_direct: Option<Arc<DnsUpstream>>,
+    pub dns_proxy: Option<Arc<DnsUpstream>>,
 }
 
 pub async fn run_system_stack(p: TunStackParams) -> Result<()> {
@@ -90,7 +146,11 @@ pub async fn run_system_stack(p: TunStackParams) -> Result<()> {
         outbounds,
         vnet_hdr,
         gro_flags,
+        dns_hijack,
+        dns_direct,
+        dns_proxy,
     } = p;
+    let dns_hijack = Arc::new(dns_hijack);
     let tcp_nat = Arc::new(TcpNat::new());
     let native = NativeTun::new(dev, vnet_hdr, gro_flags);
     let (reader, writer) = native.split();
@@ -174,6 +234,13 @@ pub async fn run_system_stack(p: TunStackParams) -> Result<()> {
         .map(|(net, pl)| broadcast_addr_v4(*net, *pl));
     let tcp_mss = compute_effective_mss(None, cfg.mtu);
 
+    if !dns_hijack.is_empty() {
+        info!(
+            rules = dns_hijack.len(),
+            "tun: dns-hijack enabled inside system stack"
+        );
+    }
+
     let rt = StackRuntime {
         writer: writer.clone(),
         tcp_nat,
@@ -190,6 +257,9 @@ pub async fn run_system_stack(p: TunStackParams) -> Result<()> {
         tcp_mss,
         #[cfg(unix)]
         icmp: Some(icmp),
+        dns_hijack,
+        dns_direct,
+        dns_proxy,
     };
 
     let mut defrag = IpDefragmenter::new();
@@ -297,6 +367,8 @@ async fn handle_tcp(
     outbounds: Arc<OutboundManager>,
 ) -> Result<()> {
     let _ = stream.set_nodelay(true);
+    // TCP DNS is rare; if dest is :53, answer via local DNS when route-hijack-style
+    // behaviour is desired — caller may still use udp dns-hijack primarily.
     let decided = target::decide(&router, dest, None).await;
     if decided.outbound == Outbound::Block {
         debug!(dest = %dest, "tun: tcp blocked");
@@ -611,6 +683,32 @@ async fn handle_udp(raw: &[u8], udp_payload: &[u8], is_v4: bool, rt: &StackRunti
             SocketAddr::V6(SocketAddrV6::new(dst_ip, dst_port, 0, 0)),
         )
     };
+
+    // DNS hijack: answer inside the stack and write reply to TUN.
+    if !rt.dns_hijack.is_empty()
+        && rt.dns_hijack.iter().any(|r| r.matches(dst))
+        && rt.dns_direct.is_some()
+        && rt.dns_proxy.is_some()
+    {
+        let query = udp_payload[8..].to_vec();
+        let router = rt.router.clone();
+        let direct = rt.dns_direct.clone().unwrap();
+        let proxy = rt.dns_proxy.clone().unwrap();
+        let writer = rt.writer.clone();
+        let reply_src = dst;
+        let reply_dst = src;
+        tokio::spawn(async move {
+            match dns::answer_query(&query, &router, &direct, &proxy).await {
+                Ok(resp) => {
+                    if let Some(pkt) = build_udp_reply(reply_src, reply_dst, &resp) {
+                        tun_write(&writer, &pkt).await;
+                    }
+                }
+                Err(e) => debug!(err = %e, "tun: dns-hijack answer failed"),
+            }
+        });
+        return;
+    }
 
     // Template = IP header + UDP header (no payload)
     let ihl = if is_v4 {
