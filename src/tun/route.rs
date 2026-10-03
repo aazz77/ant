@@ -153,7 +153,7 @@ async fn install_linux(
     pfx: &[(String, bool)],
 ) -> Result<LinuxInstalled> {
     use futures::stream::TryStreamExt;
-    use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute};
+    use netlink_packet_route::rule::{RuleAction, RuleAttribute};
     use rtnetlink::new_connection;
 
     let (conn, handle, _) = new_connection().context("rtnetlink connect")?;
@@ -292,7 +292,7 @@ async fn add_rules_redirect_mark(
     rule_start: u32,
     inst: &mut LinuxInstalled,
 ) {
-    use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute};
+    use netlink_packet_route::rule::{RuleAction, RuleAttribute};
 
     let mut prio4 = rule_start;
     let mut prio6 = rule_start;
@@ -449,7 +449,7 @@ async fn add_rules_classic(
     rule_start: u32,
     inst: &mut LinuxInstalled,
 ) {
-    use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute};
+    use netlink_packet_route::rule::{RuleAction, RuleAttribute};
 
     let nop = rule_start + 10;
     let mut prio4 = rule_start;
