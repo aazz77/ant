@@ -119,6 +119,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "libc",
+ "netlink-packet-route",
  "nftables",
  "once_cell",
  "portable-atomic",
