@@ -4,13 +4,15 @@
 
 use super::ip_defrag::IpDefragmenter;
 use super::nat::TcpNat;
+use super::gso::GroDisablementFlags;
 use super::native_tun::{NativeTun, NativeTunWriter};
 use super::packet::{
-    broadcast_addr_v4, build_icmp_echo_reply_v4, build_icmp_echo_reply_v6,
-    build_tcp_rst_v4, build_tcp_rst_v6, build_udp_reply_with_template, clamp_tcp_mss,
-    compute_effective_mss, is_global_unicast_v4, is_global_unicast_v6, recompute_ipv4_checksum,
-    recompute_tcp_checksum_v4, recompute_tcp_checksum_v6,
+    broadcast_addr_v4, build_tcp_rst_v4, build_tcp_rst_v6, build_udp_reply_with_template,
+    clamp_tcp_mss, compute_effective_mss, is_global_unicast_v4, is_global_unicast_v6,
+    recompute_ipv4_checksum, recompute_tcp_checksum_v4, recompute_tcp_checksum_v6,
 };
+#[cfg(not(unix))]
+use super::packet::{build_icmp_echo_reply_v4, build_icmp_echo_reply_v6};
 use crate::app::router::{Outbound, Router};
 use crate::app::stats;
 use crate::config::TunConfig;
@@ -63,6 +65,8 @@ struct StackRuntime {
     inet6_client: Option<Ipv6Addr>,
     inet4_broadcast: Option<Ipv4Addr>,
     tcp_mss: Option<u16>,
+    #[cfg(unix)]
+    icmp: Option<Arc<super::icmp_forwarder::IcmpForwarder>>,
 }
 
 pub async fn run_system_stack(
@@ -73,9 +77,10 @@ pub async fn run_system_stack(
     router: Arc<Router>,
     outbounds: Arc<OutboundManager>,
     vnet_hdr: bool,
+    gro_flags: GroDisablementFlags,
 ) -> Result<()> {
     let tcp_nat = Arc::new(TcpNat::new());
-    let native = NativeTun::new(dev, vnet_hdr);
+    let native = NativeTun::new(dev, vnet_hdr, gro_flags);
     let (reader, writer) = native.split();
 
     let tcp_listener_v4 = match addrs.inet4_server {
@@ -117,6 +122,14 @@ pub async fn run_system_stack(
     let udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    #[cfg(unix)]
+    let icmp = super::icmp_forwarder::IcmpForwarder::new(
+        writer.clone(),
+        router.clone(),
+        outbounds.clone(),
+    );
+
+
     {
         let nat = tcp_nat.clone();
         let sessions = udp_sessions.clone();
@@ -131,6 +144,18 @@ pub async fn run_system_stack(
         });
     }
 
+
+    {
+        let w = writer.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let mut g = w.lock().await;
+                let _ = g.flush_gro().await;
+            }
+        });
+    }
+
     let inet4_broadcast = addrs
         .prefixes_v4
         .first()
@@ -138,7 +163,7 @@ pub async fn run_system_stack(
     let tcp_mss = compute_effective_mss(None, cfg.mtu);
 
     let rt = StackRuntime {
-        writer,
+        writer: writer.clone(),
         tcp_nat,
         udp_sessions,
         router,
@@ -151,6 +176,8 @@ pub async fn run_system_stack(
         inet6_client: addrs.inet6_client,
         inet4_broadcast,
         tcp_mss,
+        #[cfg(unix)]
+        icmp: Some(icmp),
     };
 
     let mut defrag = IpDefragmenter::new();
@@ -303,6 +330,13 @@ async fn process_ipv4(raw: &[u8], rt: &StackRuntime) {
             handle_udp(raw, payload, true, rt).await;
         }
         IPPROTO_ICMP => {
+            #[cfg(unix)]
+            if let Some(ref icmp) = rt.icmp {
+                if icmp.handle_packet(raw).await {
+                    return;
+                }
+            }
+            #[cfg(not(unix))]
             if let Some(reply) = build_icmp_echo_reply_v4(raw) {
                 tun_write(&rt.writer, &reply).await;
             }
@@ -331,6 +365,13 @@ async fn process_ipv6(raw: &[u8], rt: &StackRuntime) {
             handle_udp(raw, payload, false, rt).await;
         }
         IPPROTO_ICMPV6 => {
+            #[cfg(unix)]
+            if let Some(ref icmp) = rt.icmp {
+                if icmp.handle_packet(raw).await {
+                    return;
+                }
+            }
+            #[cfg(not(unix))]
             if let Some(reply) = build_icmp_echo_reply_v6(raw) {
                 tun_write(&rt.writer, &reply).await;
             }

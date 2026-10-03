@@ -12,6 +12,8 @@ mod gso;
 mod ip_defrag;
 mod nat;
 mod native_tun;
+#[cfg(unix)]
+mod icmp_forwarder;
 mod offload;
 mod packet;
 mod stack;
@@ -99,7 +101,7 @@ pub async fn run_tun(
     device::configure_addresses(&if_name, &cfg, &prefixes_v4, &prefixes_v6).await?;
 
     // Linux: probe IFF_VNET_HDR + TUNSETOFFLOAD for GSO/GRO.
-    let vnet_hdr = {
+    let (vnet_hdr, gro_flags) = {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             use std::os::fd::AsRawFd;
@@ -110,11 +112,21 @@ pub async fn run_tun(
                 udp_gso = off.udp_gso,
                 "tun: offload probe"
             );
-            off.vnet_hdr
+            let mut gro = gso::GroDisablementFlags::default();
+            if !off.tcp_gso {
+                gro.disable_tcp();
+            }
+            if !off.udp_gso {
+                gro.disable_udp();
+            }
+            (off.vnet_hdr, gro)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
-            false
+            // WinTun: pure IP frames (no kernel virtio_net_hdr / TUNSETOFFLOAD).
+            // Userspace GRO on the write path is still enabled inside NativeTunWriter.
+            info!("tun: Windows/WinTun path — userspace GRO on write, no kernel vnet_hdr/GSO");
+            (false, gso::GroDisablementFlags::default())
         }
     };
 
@@ -135,6 +147,7 @@ pub async fn run_tun(
         router,
         outbounds,
         vnet_hdr,
+        gro_flags,
     )
     .await
 }
