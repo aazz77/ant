@@ -73,6 +73,9 @@ tun = { version = "0.8", features = ["async"] }
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 etherparse = "0.15"
+# OS control plane (sing-tun equivalent): routes/rules + nftables
+rtnetlink = "0.14"
+nftables = "0.6"
 
 [profile.release]
 lto = true
