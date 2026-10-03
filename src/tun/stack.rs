@@ -1,9 +1,15 @@
 //! System stack: TCP NAT + UDP sessions + accept/dial relay.
+//! Packet path: defrag, ICMP echo, MSS clamp, RST on NAT exhaustion,
+//! UDP template replies. Device I/O via NativeTun (vnet_hdr + GSO split).
 
+use super::ip_defrag::IpDefragmenter;
 use super::nat::TcpNat;
+use super::native_tun::{NativeTun, NativeTunWriter};
 use super::packet::{
-    build_udp_reply, broadcast_addr_v4, is_global_unicast_v4, is_global_unicast_v6,
-    recompute_ipv4_checksum, recompute_tcp_checksum_v4, recompute_tcp_checksum_v6,
+    broadcast_addr_v4, build_icmp_echo_reply_v4, build_icmp_echo_reply_v6,
+    build_tcp_rst_v4, build_tcp_rst_v6, build_udp_reply_with_template, clamp_tcp_mss,
+    compute_effective_mss, is_global_unicast_v4, is_global_unicast_v6, recompute_ipv4_checksum,
+    recompute_tcp_checksum_v4, recompute_tcp_checksum_v6,
 };
 use crate::app::router::{Outbound, Router};
 use crate::app::stats;
@@ -16,25 +22,26 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
 const UDP_IDLE: Duration = Duration::from_secs(300);
 const TCP_NAT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Channel item: (payload, destination).
 type UdpPacket = (Bytes, SocketAddr);
 
 struct UdpEntry {
     packet_tx: mpsc::Sender<UdpPacket>,
     last_seen: Instant,
+    /// IP+UDP header template from the first request packet.
+    template: Vec<u8>,
 }
 
-/// Addresses derived from `tun.address` for the system stack.
 pub struct StackAddrs {
     pub inet4_server: Option<Ipv4Addr>,
     pub inet4_client: Option<Ipv4Addr>,
@@ -43,10 +50,9 @@ pub struct StackAddrs {
     pub prefixes_v4: Vec<(Ipv4Addr, u8)>,
 }
 
-/// Shared runtime handles passed through the packet path.
 #[derive(Clone)]
 struct StackRuntime {
-    writer: Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
+    writer: Arc<Mutex<NativeTunWriter>>,
     tcp_nat: Arc<TcpNat>,
     udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
     router: Arc<Router>,
@@ -58,6 +64,7 @@ struct StackRuntime {
     inet6_server: Option<Ipv6Addr>,
     inet6_client: Option<Ipv6Addr>,
     inet4_broadcast: Option<Ipv4Addr>,
+    tcp_mss: Option<u16>,
 }
 
 pub async fn run_system_stack(
@@ -67,10 +74,11 @@ pub async fn run_system_stack(
     addrs: StackAddrs,
     router: Arc<Router>,
     outbounds: Arc<OutboundManager>,
+    vnet_hdr: bool,
 ) -> Result<()> {
     let tcp_nat = Arc::new(TcpNat::new());
-    let (mut reader, writer) = tokio::io::split(dev);
-    let writer = Arc::new(Mutex::new(writer));
+    let native = NativeTun::new(dev, vnet_hdr);
+    let (reader, writer) = native.split();
 
     let tcp_listener_v4 = match addrs.inet4_server {
         Some(addr) => bind_with_retry(SocketAddr::V4(SocketAddrV4::new(addr, 0))).await,
@@ -99,15 +107,7 @@ pub async fn run_system_stack(
         info!(interface = %if_name, port = tcp_port_v6, "tun: TCP v6 listener ready");
     }
 
-    if let Some(listener) = tcp_listener_v4 {
-        let nat = tcp_nat.clone();
-        let r = router.clone();
-        let o = outbounds.clone();
-        tokio::spawn(async move {
-            accept_loop(listener, nat, r, o).await;
-        });
-    }
-    if let Some(listener) = tcp_listener_v6 {
+    for listener in [tcp_listener_v4, tcp_listener_v6].into_iter().flatten() {
         let nat = tcp_nat.clone();
         let r = router.clone();
         let o = outbounds.clone();
@@ -137,6 +137,7 @@ pub async fn run_system_stack(
         .prefixes_v4
         .first()
         .map(|(net, pl)| broadcast_addr_v4(*net, *pl));
+    let tcp_mss = compute_effective_mss(None, cfg.mtu);
 
     let rt = StackRuntime {
         writer,
@@ -151,33 +152,55 @@ pub async fn run_system_stack(
         inet6_server: addrs.inet6_server,
         inet6_client: addrs.inet6_client,
         inet4_broadcast,
+        tcp_mss,
     };
 
-    let mut buf = vec![0u8; (cfg.mtu as usize).saturating_add(64).max(2048)];
+    let mut defrag = IpDefragmenter::new();
+    let mut reader = reader.lock().await;
+    // NOTE: holding reader lock for the whole loop is fine (single reader task).
+
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => {
+        let pkt = match reader.read_packet().await {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 warn!("tun: device EOF");
                 break;
             }
-            Ok(n) => n,
             Err(e) => {
                 warn!(err = %e, "tun: read error");
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
         };
-        if n < 20 {
+        if pkt.len() < 20 {
             continue;
         }
-        let pkt = &buf[..n];
         match pkt[0] >> 4 {
-            4 => process_ipv4(pkt, &rt).await,
-            6 if n >= 40 => process_ipv6(pkt, &rt).await,
+            4 => {
+                let flags_frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+                let is_frag = (flags_frag & 0x1fff) != 0 || (flags_frag & 0x2000) != 0;
+                let full = if is_frag {
+                    defrag.feed(&pkt, Instant::now())
+                } else {
+                    Some(pkt)
+                };
+                if let Some(full) = full {
+                    process_ipv4(&full, &rt).await;
+                }
+            }
+            6 if pkt.len() >= 40 => {
+                let full = if super::ip_defrag::ipv6_is_fragment(&pkt) {
+                    defrag.feed_ipv6(&pkt, Instant::now())
+                } else {
+                    Some(pkt)
+                };
+                if let Some(full) = full {
+                    process_ipv6(&full, &rt).await;
+                }
+            }
             _ => {}
         }
     }
-
     Ok(())
 }
 
@@ -268,11 +291,6 @@ async fn process_ipv4(raw: &[u8], rt: &StackRuntime) {
     if ihl < 20 || raw.len() < ihl {
         return;
     }
-    let flags_frag = u16::from_be_bytes([raw[6], raw[7]]);
-    if (flags_frag & 0x1fff) != 0 || (flags_frag & 0x2000) != 0 {
-        return; // drop fragments
-    }
-
     let src_ip = Ipv4Addr::from([raw[12], raw[13], raw[14], raw[15]]);
     let dst_ip = Ipv4Addr::from([raw[16], raw[17], raw[18], raw[19]]);
     if Some(dst_ip) == rt.inet4_broadcast {
@@ -284,14 +302,12 @@ async fn process_ipv4(raw: &[u8], rt: &StackRuntime) {
             handle_tcp_v4(raw, payload, src_ip, dst_ip, rt).await;
         }
         IPPROTO_UDP => {
-            handle_udp(
-                payload,
-                SocketAddr::V4(SocketAddrV4::new(src_ip, 0)),
-                SocketAddr::V4(SocketAddrV4::new(dst_ip, 0)),
-                true,
-                rt,
-            )
-            .await;
+            handle_udp(raw, payload, true, rt).await;
+        }
+        IPPROTO_ICMP => {
+            if let Some(reply) = build_icmp_echo_reply_v4(raw) {
+                tun_write(&rt.writer, &reply).await;
+            }
         }
         _ => {}
     }
@@ -301,26 +317,53 @@ async fn process_ipv6(raw: &[u8], rt: &StackRuntime) {
     if raw.len() < 40 {
         return;
     }
-    let next = raw[6];
+    // Skip extension headers to find L4 (simplified walk)
+    let (next, l4_off) = ipv6_l4_offset(raw);
+    if l4_off >= raw.len() {
+        return;
+    }
     let src_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&raw[8..24]).unwrap());
     let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&raw[24..40]).unwrap());
-    let payload = &raw[40..];
+    let payload = &raw[l4_off..];
     match next {
         IPPROTO_TCP if rt.tcp_port_v6 != 0 => {
-            handle_tcp_v6(raw, payload, src_ip, dst_ip, rt).await;
+            handle_tcp_v6(raw, payload, l4_off, src_ip, dst_ip, rt).await;
         }
         IPPROTO_UDP => {
-            handle_udp(
-                payload,
-                SocketAddr::V6(SocketAddrV6::new(src_ip, 0, 0, 0)),
-                SocketAddr::V6(SocketAddrV6::new(dst_ip, 0, 0, 0)),
-                false,
-                rt,
-            )
-            .await;
+            handle_udp(raw, payload, false, rt).await;
+        }
+        IPPROTO_ICMPV6 => {
+            if let Some(reply) = build_icmp_echo_reply_v6(raw) {
+                tun_write(&rt.writer, &reply).await;
+            }
         }
         _ => {}
     }
+}
+
+/// Walk IPv6 extension headers; return (next_header, offset of L4).
+fn ipv6_l4_offset(raw: &[u8]) -> (u8, usize) {
+    let mut next = raw[6];
+    let mut off = 40usize;
+    // hopopt=0, routing=43, dstopts=60, fragment=44 (should be reassembled already)
+    for _ in 0..8 {
+        match next {
+            0 | 43 | 60 => {
+                if off + 2 > raw.len() {
+                    return (next, off);
+                }
+                let hdr_len = (raw[off + 1] as usize + 1) * 8;
+                next = raw[off];
+                off += hdr_len;
+            }
+            44 => {
+                // fragment left after failed reassembly — stop
+                return (next, off);
+            }
+            _ => return (next, off),
+        }
+    }
+    (next, off)
 }
 
 async fn handle_tcp_v4(
@@ -357,6 +400,9 @@ async fn handle_tcp_v4(
             pkt[16..20].copy_from_slice(&nd.octets());
             pkt[ihl..ihl + 2].copy_from_slice(&nsp.to_be_bytes());
             pkt[ihl + 2..ihl + 4].copy_from_slice(&ndp.to_be_bytes());
+            if let Some(mss) = rt.tcp_mss {
+                clamp_tcp_mss(&mut pkt, ihl, mss);
+            }
             recompute_tcp_checksum_v4(&mut pkt, ihl);
             recompute_ipv4_checksum(&mut pkt);
             tun_write(&rt.writer, &pkt).await;
@@ -372,6 +418,16 @@ async fn handle_tcp_v4(
     let dst = SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port));
     let Some(nat_port) = rt.tcp_nat.lookup_or_insert(src, dst).await else {
         warn!("tun: TCP NAT port space exhausted");
+        if tcp_payload.len() >= 8 {
+            let seq = u32::from_be_bytes([
+                tcp_payload[4],
+                tcp_payload[5],
+                tcp_payload[6],
+                tcp_payload[7],
+            ]);
+            let rst = build_tcp_rst_v4(dst_ip, src_ip, dst_port, src_port, seq);
+            tun_write(&rt.writer, &rst).await;
+        }
         return;
     };
 
@@ -380,6 +436,9 @@ async fn handle_tcp_v4(
     pkt[16..20].copy_from_slice(&server_addr.octets());
     pkt[ihl..ihl + 2].copy_from_slice(&nat_port.to_be_bytes());
     pkt[ihl + 2..ihl + 4].copy_from_slice(&tcp_port.to_be_bytes());
+    if let Some(mss) = rt.tcp_mss {
+        clamp_tcp_mss(&mut pkt, ihl, mss);
+    }
     recompute_tcp_checksum_v4(&mut pkt, ihl);
     recompute_ipv4_checksum(&mut pkt);
     tun_write(&rt.writer, &pkt).await;
@@ -388,6 +447,7 @@ async fn handle_tcp_v4(
 async fn handle_tcp_v6(
     raw: &[u8],
     tcp_payload: &[u8],
+    tcp_off: usize,
     src_ip: Ipv6Addr,
     dst_ip: Ipv6Addr,
     rt: &StackRuntime,
@@ -399,7 +459,6 @@ async fn handle_tcp_v6(
     if tcp_payload.len() < 20 {
         return;
     }
-    let tcp_off = 40;
     let src_port = u16::from_be_bytes([tcp_payload[0], tcp_payload[1]]);
     let dst_port = u16::from_be_bytes([tcp_payload[2], tcp_payload[3]]);
     let tcp_port = rt.tcp_port_v6;
@@ -419,6 +478,9 @@ async fn handle_tcp_v6(
             pkt[24..40].copy_from_slice(&nd.octets());
             pkt[tcp_off..tcp_off + 2].copy_from_slice(&nsp.to_be_bytes());
             pkt[tcp_off + 2..tcp_off + 4].copy_from_slice(&ndp.to_be_bytes());
+            if let Some(mss) = rt.tcp_mss {
+                clamp_tcp_mss(&mut pkt, tcp_off, mss);
+            }
             recompute_tcp_checksum_v6(&mut pkt, tcp_off);
             tun_write(&rt.writer, &pkt).await;
         }
@@ -433,6 +495,16 @@ async fn handle_tcp_v6(
     let dst = SocketAddr::V6(SocketAddrV6::new(dst_ip, dst_port, 0, 0));
     let Some(nat_port) = rt.tcp_nat.lookup_or_insert(src, dst).await else {
         warn!("tun: TCP NAT port space exhausted (v6)");
+        if tcp_payload.len() >= 8 {
+            let seq = u32::from_be_bytes([
+                tcp_payload[4],
+                tcp_payload[5],
+                tcp_payload[6],
+                tcp_payload[7],
+            ]);
+            let rst = build_tcp_rst_v6(dst_ip, src_ip, dst_port, src_port, seq);
+            tun_write(&rt.writer, &rst).await;
+        }
         return;
     };
 
@@ -441,75 +513,101 @@ async fn handle_tcp_v6(
     pkt[24..40].copy_from_slice(&server_addr.octets());
     pkt[tcp_off..tcp_off + 2].copy_from_slice(&nat_port.to_be_bytes());
     pkt[tcp_off + 2..tcp_off + 4].copy_from_slice(&tcp_port.to_be_bytes());
+    if let Some(mss) = rt.tcp_mss {
+        clamp_tcp_mss(&mut pkt, tcp_off, mss);
+    }
     recompute_tcp_checksum_v6(&mut pkt, tcp_off);
     tun_write(&rt.writer, &pkt).await;
 }
 
-async fn handle_udp(
-    udp_payload: &[u8],
-    mut src: SocketAddr,
-    mut dst: SocketAddr,
-    is_v4: bool,
-    rt: &StackRuntime,
-) {
+async fn handle_udp(raw: &[u8], udp_payload: &[u8], is_v4: bool, rt: &StackRuntime) {
     if udp_payload.len() < 8 {
         return;
     }
     let src_port = u16::from_be_bytes([udp_payload[0], udp_payload[1]]);
     let dst_port = u16::from_be_bytes([udp_payload[2], udp_payload[3]]);
-    src.set_port(src_port);
-    dst.set_port(dst_port);
-
-    if is_v4 {
-        if let SocketAddr::V4(a) = dst {
-            if !is_global_unicast_v4(*a.ip()) {
-                return;
-            }
-        }
-    } else if let SocketAddr::V6(a) = dst {
-        if !is_global_unicast_v6(*a.ip()) {
+    let (src, dst) = if is_v4 {
+        if raw.len() < 20 {
             return;
         }
-    }
+        let src_ip = Ipv4Addr::from([raw[12], raw[13], raw[14], raw[15]]);
+        let dst_ip = Ipv4Addr::from([raw[16], raw[17], raw[18], raw[19]]);
+        if !is_global_unicast_v4(dst_ip) {
+            return;
+        }
+        (
+            SocketAddr::V4(SocketAddrV4::new(src_ip, src_port)),
+            SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)),
+        )
+    } else {
+        if raw.len() < 40 {
+            return;
+        }
+        let src_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&raw[8..24]).unwrap());
+        let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&raw[24..40]).unwrap());
+        if !is_global_unicast_v6(dst_ip) {
+            return;
+        }
+        (
+            SocketAddr::V6(SocketAddrV6::new(src_ip, src_port, 0, 0)),
+            SocketAddr::V6(SocketAddrV6::new(dst_ip, dst_port, 0, 0)),
+        )
+    };
 
+    // Template = IP header + UDP header (no payload)
+    let ihl = if is_v4 {
+        ((raw[0] & 0x0f) as usize) * 4
+    } else {
+        40
+    };
+    let template = if raw.len() >= ihl + 8 {
+        raw[..ihl + 8].to_vec()
+    } else {
+        Vec::new()
+    };
     let data = Bytes::copy_from_slice(&udp_payload[8..]);
-    feed_udp(src, dst, data, rt).await;
+    feed_udp(src, dst, data, template, rt).await;
 }
 
-async fn feed_udp(src: SocketAddr, dst: SocketAddr, data: Bytes, rt: &StackRuntime) {
-    {
-        let mut map = rt.udp_sessions.lock().await;
-        if let Some(e) = map.get_mut(&src) {
-            e.last_seen = Instant::now();
-            let _ = e.packet_tx.try_send((data, dst));
-            return;
-        }
-
-        let (tx, rx) = mpsc::channel::<UdpPacket>(64);
-        let _ = tx.try_send((data, dst));
-        map.insert(
-            src,
-            UdpEntry {
-                packet_tx: tx,
-                last_seen: Instant::now(),
-            },
-        );
-        drop(map);
-
-        let writer = rt.writer.clone();
-        let sessions = rt.udp_sessions.clone();
-        let router = rt.router.clone();
-        let outbounds = rt.outbounds.clone();
-        tokio::spawn(async move {
-            run_udp_session(src, rx, writer, sessions, router, outbounds).await;
-        });
+async fn feed_udp(
+    src: SocketAddr,
+    dst: SocketAddr,
+    data: Bytes,
+    template: Vec<u8>,
+    rt: &StackRuntime,
+) {
+    let mut map = rt.udp_sessions.lock().await;
+    if let Some(e) = map.get_mut(&src) {
+        e.last_seen = Instant::now();
+        let _ = e.packet_tx.try_send((data, dst));
+        return;
     }
+    let (tx, rx) = mpsc::channel::<UdpPacket>(64);
+    let _ = tx.try_send((data, dst));
+    map.insert(
+        src,
+        UdpEntry {
+            packet_tx: tx,
+            last_seen: Instant::now(),
+            template: template.clone(),
+        },
+    );
+    drop(map);
+
+    let writer = rt.writer.clone();
+    let sessions = rt.udp_sessions.clone();
+    let router = rt.router.clone();
+    let outbounds = rt.outbounds.clone();
+    tokio::spawn(async move {
+        run_udp_session(src, rx, template, writer, sessions, router, outbounds).await;
+    });
 }
 
 async fn run_udp_session(
     client: SocketAddr,
     mut rx: mpsc::Receiver<UdpPacket>,
-    writer: Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
+    template: Vec<u8>,
+    writer: Arc<Mutex<NativeTunWriter>>,
     sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
     router: Arc<Router>,
     outbounds: Arc<OutboundManager>,
@@ -539,9 +637,12 @@ async fn run_udp_session(
 
     let sess_r = sess.clone();
     let writer_r = writer.clone();
+    let tmpl = template.clone();
     let recv_task = tokio::spawn(async move {
         while let Ok((payload, from)) = sess_r.recv_from().await {
-            if let Some(pkt) = build_udp_reply(from, client, &payload) {
+            if let Some(pkt) =
+                build_udp_reply_with_template(&tmpl, from, client, &payload)
+            {
                 tun_write(&writer_r, &pkt).await;
             }
         }
@@ -571,12 +672,9 @@ async fn run_udp_session(
     sessions.lock().await.remove(&client);
 }
 
-async fn tun_write(
-    writer: &Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
-    pkt: &[u8],
-) {
+async fn tun_write(writer: &Arc<Mutex<NativeTunWriter>>, pkt: &[u8]) {
     let mut w = writer.lock().await;
-    if let Err(e) = w.write_all(pkt).await {
+    if let Err(e) = w.write_packet(pkt).await {
         debug!(err = %e, "tun: write failed");
     }
 }

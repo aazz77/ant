@@ -31,9 +31,10 @@ pub async fn create_device(cfg: &TunConfig) -> Result<(tun::AsyncDevice, String)
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // No IFF_VNET_HDR — plain IP frames (keeps the system stack simple).
+        // IFF_VNET_HDR enables virtio_net_hdr on every R/W (required for GSO/GRO).
         tun_cfg.platform_config(|p| {
             p.ensure_root_privileges(true);
+            p.vnet_hdr(true);
         });
     }
 

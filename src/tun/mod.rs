@@ -8,7 +8,11 @@
 //! `netsh` (Windows).
 
 mod device;
+mod gso;
+mod ip_defrag;
 mod nat;
+mod native_tun;
+mod offload;
 mod packet;
 mod stack;
 
@@ -94,6 +98,39 @@ pub async fn run_tun(
     // Configure addresses / MTU via platform tools (no routes).
     device::configure_addresses(&if_name, &cfg, &prefixes_v4, &prefixes_v6).await?;
 
+    // Linux: probe IFF_VNET_HDR + TUNSETOFFLOAD for GSO/GRO.
+    let vnet_hdr = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd;
+            use tun::AbstractDevice as _;
+            // AsyncDevice may expose as_raw_fd via underlying device.
+            let fd = {
+                // tun 0.8 AsyncDevice: try get_ref raw fd
+                use std::os::fd::AsRawFd as _;
+                // Configuration already requested vnet_hdr; probe via ioctl on the fd
+                // held by the device if available.
+                #[allow(unused_imports)]
+                use std::os::unix::io::AsRawFd as UnixAsRawFd;
+                // Fall back: setup_tun_offload needs a fd. tun::AsyncDevice implements AsRawFd on unix.
+                let fd = dev.as_raw_fd();
+                let off = offload::setup_tun_offload(fd);
+                info!(
+                    vnet_hdr = off.vnet_hdr,
+                    tcp_gso = off.tcp_gso,
+                    udp_gso = off.udp_gso,
+                    "tun: offload probe"
+                );
+                off.vnet_hdr
+            };
+            fd
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            false
+        }
+    };
+
     // Brief wait so the OS registers the address before we bind listeners.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -110,6 +147,7 @@ pub async fn run_tun(
         },
         router,
         outbounds,
+        vnet_hdr,
     )
     .await
 }
