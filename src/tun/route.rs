@@ -1,91 +1,83 @@
-//! auto-route / strict-route (Linux + Windows).
-//!
-//! Installs split-default (or custom) routes into the TUN device and optional
-//! policy-routing so fwmark-ed proxy traffic stays on the main table.
+//! auto-route / strict-route via **rtnetlink** (Linux) + netsh (Windows).
+//! Rule topology follows sing-tun NativeTun.rules().
 
 use crate::config::TunConfig;
+use crate::tun::marks::{
+    TunMarks, DEFAULT_FALLBACK_RULE_PRIORITY, DEFAULT_RULE_PRIORITY, DEFAULT_TABLE,
+};
 use anyhow::{Context, Result};
-use std::process::Command;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tracing::{info, warn};
 
-/// RAII guard: removes installed routes/rules on drop.
 pub struct RouteGuard {
-    cleanup: Vec<CleanupAction>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    linux: Option<LinuxInstalled>,
+    #[cfg(target_os = "windows")]
+    win: Vec<(bool, String, String)>,
 }
 
-enum CleanupAction {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    LinuxRoute {
-        v6: bool,
-        dest: String,
-        dev: String,
-        table: Option<i32>,
-    },
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    LinuxRule { args: Vec<String> },
-    #[cfg(target_os = "windows")]
-    WinRoute {
-        v6: bool,
-        dest: String,
-        if_name: String,
-    },
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct LinuxInstalled {
+    if_index: u32,
+    table: u32,
+    routes: Vec<(bool, String)>, // v6, dest CIDR
+    /// (priority, family_v6) for rule del by priority
+    rules: Vec<(u32, bool)>,
 }
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        while let Some(action) = self.cleanup.pop() {
-            match action {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                CleanupAction::LinuxRoute {
-                    v6,
-                    dest,
-                    dev,
-                    table,
-                } => {
-                    let mut args: Vec<String> = vec![
-                        if v6 { "-6".into() } else { "-4".into() },
-                        "route".into(),
-                        "del".into(),
-                        dest,
-                        "dev".into(),
-                        dev,
-                    ];
-                    if let Some(t) = table {
-                        args.push("table".into());
-                        args.push(t.to_string());
-                    }
-                    let r: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                    run_ip(&r);
-                }
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                CleanupAction::LinuxRule { args } => {
-                    let mut full = vec!["rule".to_string(), "del".to_string()];
-                    full.extend(args);
-                    let r: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
-                    run_ip(&r);
-                }
-                #[cfg(target_os = "windows")]
-                CleanupAction::WinRoute { v6, dest, if_name } => {
-                    let family = if v6 { "ipv6" } else { "ipv4" };
-                    run_cmd(
-                        "netsh",
-                        &[
-                            "interface",
-                            family,
-                            "delete",
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if let Some(ref inst) = self.linux {
+                // Best-effort sync cleanup via `ip` so Drop stays sync/reliable on exit.
+                for (v6, dest) in &inst.routes {
+                    let fam = if *v6 { "-6" } else { "-4" };
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            fam,
                             "route",
-                            &dest,
-                            &format!("interface={if_name}"),
-                        ],
-                    );
+                            "del",
+                            dest,
+                            "table",
+                            &inst.table.to_string(),
+                        ])
+                        .output();
                 }
+                for (prio, v6) in &inst.rules {
+                    let mut cmd = std::process::Command::new("ip");
+                    if *v6 {
+                        cmd.arg("-6");
+                    } else {
+                        cmd.arg("-4");
+                    }
+                    let _ = cmd
+                        .args(["rule", "del", "priority", &prio.to_string()])
+                        .output();
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            for (v6, dest, if_name) in &self.win {
+                let family = if *v6 { "ipv6" } else { "ipv4" };
+                let _ = std::process::Command::new("netsh")
+                    .args([
+                        "interface",
+                        family,
+                        "delete",
+                        "route",
+                        dest,
+                        &format!("interface={if_name}"),
+                    ])
+                    .output();
             }
         }
         info!("tun: auto-route cleaned up");
     }
 }
 
-fn route_prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
+fn prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
     let mut out = Vec::new();
     if cfg.route_address.is_empty() {
         for (s, v6) in [
@@ -95,7 +87,7 @@ fn route_prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
             ("8000::/1", true),
         ] {
             if !cfg.route_exclude_address.iter().any(|e| e == s) {
-                out.push((s.to_string(), v6));
+                out.push((s.into(), v6));
             }
         }
     } else {
@@ -103,15 +95,14 @@ fn route_prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
             if cfg.route_exclude_address.iter().any(|e| e == s) {
                 continue;
             }
-            let (ip_s, pl_s) = s
+            let (ip, pl) = s
                 .split_once('/')
-                .ok_or_else(|| anyhow::anyhow!("route-address: expected CIDR, got `{s}`"))?;
-            let _: std::net::IpAddr = ip_s.parse().context("route-address IP")?;
-            let pl: u8 = pl_s.parse().context("route-address prefix")?;
+                .ok_or_else(|| anyhow::anyhow!("route-address CIDR required: {s}"))?;
+            let _: std::net::IpAddr = ip.parse().context("route-address")?;
+            let pl: u8 = pl.parse().context("prefix")?;
             let v6 = s.contains(':');
-            let max = if v6 { 128 } else { 32 };
-            if pl > max {
-                anyhow::bail!("route-address prefix {pl} > {max}");
+            if pl > if v6 { 128 } else { 32 } {
+                anyhow::bail!("bad prefix {pl}");
             }
             out.push((s.clone(), v6));
         }
@@ -119,20 +110,26 @@ fn route_prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
     Ok(out)
 }
 
-/// Install routes according to `cfg`. Returns a guard that undoes them on drop.
-pub fn install_routes(if_name: &str, cfg: &TunConfig, fwmark: u32) -> Result<RouteGuard> {
-    let mut guard = RouteGuard {
-        cleanup: Vec::new(),
-    };
-    let prefixes = route_prefixes(cfg)?;
+pub async fn install_routes(
+    if_name: &str,
+    cfg: &TunConfig,
+    marks: TunMarks,
+    has_v4: bool,
+    has_v6: bool,
+) -> Result<RouteGuard> {
+    let pfx = prefixes(cfg)?;
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    install_linux(if_name, cfg, fwmark, &prefixes, &mut guard)?;
+    {
+        let linux = install_linux(if_name, cfg, marks, has_v4, has_v6, &pfx).await?;
+        return Ok(RouteGuard { linux: Some(linux) });
+    }
 
     #[cfg(target_os = "windows")]
     {
-        let _ = fwmark;
-        install_windows(if_name, cfg, &prefixes, &mut guard)?;
+        let _ = (marks, has_v4, has_v6);
+        let win = install_windows(if_name, cfg, &pfx)?;
+        return Ok(RouteGuard { win });
     }
 
     #[cfg(not(any(
@@ -141,182 +138,560 @@ pub fn install_routes(if_name: &str, cfg: &TunConfig, fwmark: u32) -> Result<Rou
         target_os = "windows"
     )))]
     {
-        let _ = (if_name, cfg, fwmark, &prefixes);
-        warn!("tun: auto-route not supported on this platform");
+        let _ = (if_name, cfg, marks, has_v4, has_v6, pfx);
+        Ok(RouteGuard {})
     }
-
-    Ok(guard)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn install_linux(
+async fn install_linux(
     if_name: &str,
     cfg: &TunConfig,
-    fwmark: u32,
-    prefixes: &[(String, bool)],
-    guard: &mut RouteGuard,
-) -> Result<()> {
-    let table = cfg.iproute2_table_index;
-    let rule_prio = cfg.iproute2_rule_index;
-    let use_table = fwmark != 0;
-    let table_opt = if use_table { Some(table) } else { None };
+    marks: TunMarks,
+    has_v4: bool,
+    has_v6: bool,
+    pfx: &[(String, bool)],
+) -> Result<LinuxInstalled> {
+    use futures::stream::TryStreamExt;
+    use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute};
+    use rtnetlink::new_connection;
 
-    for (dest, v6) in prefixes {
-        let mut args: Vec<String> = vec![
-            if *v6 { "-6".into() } else { "-4".into() },
-            "route".into(),
-            "replace".into(),
-            dest.clone(),
-            "dev".into(),
-            if_name.into(),
-        ];
-        if let Some(t) = table_opt {
-            args.push("table".into());
-            args.push(t.to_string());
+    let (conn, handle, _) = new_connection().context("rtnetlink connect")?;
+    tokio::spawn(conn);
+
+    // Resolve interface index
+    let mut links = handle.link().get().match_name(if_name.to_string()).execute();
+    let link = links
+        .try_next()
+        .await
+        .context("link get")?
+        .ok_or_else(|| anyhow::anyhow!("interface {if_name} not found"))?;
+    let if_index = link.header.index;
+
+    let table = if cfg.iproute2_table_index != 0 {
+        cfg.iproute2_table_index as u32
+    } else {
+        DEFAULT_TABLE as u32
+    };
+    let rule_start = if cfg.iproute2_rule_index != 0 {
+        cfg.iproute2_rule_index as u32
+    } else {
+        DEFAULT_RULE_PRIORITY as u32
+    };
+
+    let mut installed = LinuxInstalled {
+        if_index,
+        table,
+        routes: Vec::new(),
+        rules: Vec::new(),
+    };
+
+    // --- routes in dedicated table ---
+    for (dest, v6) in pfx {
+        if *v6 && !has_v6 {
+            continue;
         }
-        let r: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        run_ip(&r);
-        guard.cleanup.push(CleanupAction::LinuxRoute {
-            v6: *v6,
-            dest: dest.clone(),
-            dev: if_name.into(),
-            table: table_opt,
-        });
+        if !*v6 && !has_v4 {
+            continue;
+        }
+        if let Err(e) = add_route(&handle, if_index, table, dest, *v6).await {
+            warn!(dest = %dest, err = %e, "rtnetlink route add failed");
+        } else {
+            installed.routes.push((*v6, dest.clone()));
+        }
     }
 
-    if use_table {
-        let rule_not = vec![
-            "not".into(),
-            "fwmark".into(),
-            fwmark.to_string(),
-            "table".into(),
-            table.to_string(),
-            "priority".into(),
-            rule_prio.to_string(),
-        ];
-        {
-            let mut full = vec!["rule".into(), "add".into()];
-            full.extend(rule_not.iter().cloned());
-            let r: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
-            run_ip(&r);
-        }
-        guard.cleanup.push(CleanupAction::LinuxRule {
-            args: rule_not,
-        });
-
-        let rule_mark = vec![
-            "fwmark".into(),
-            fwmark.to_string(),
-            "table".into(),
-            "main".into(),
-            "priority".into(),
-            (rule_prio - 1).to_string(),
-        ];
-        {
-            let mut full = vec!["rule".into(), "add".into()];
-            full.extend(rule_mark.iter().cloned());
-            let r: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
-            run_ip(&r);
-        }
-        guard.cleanup.push(CleanupAction::LinuxRule {
-            args: rule_mark,
-        });
-    }
-
-    if cfg.strict_route {
-        for (dest, v6) in [
-            ("0.0.0.0/1", false),
-            ("128.0.0.0/1", false),
-            ("::/1", true),
-            ("8000::/1", true),
-        ] {
-            if prefixes.iter().any(|(d, _)| d == dest) {
-                continue;
-            }
-            let args = [
-                if v6 { "-6" } else { "-4" },
-                "route",
-                "replace",
-                dest,
-                "dev",
-                if_name,
-            ];
-            run_ip(&args);
-            guard.cleanup.push(CleanupAction::LinuxRoute {
-                v6,
-                dest: dest.into(),
-                dev: if_name.into(),
-                table: None,
-            });
-        }
-        info!("tun: strict-route enabled");
+    // --- rules ---
+    if marks.redirect_mode {
+        add_rules_redirect_mark(
+            &handle,
+            marks,
+            has_v4,
+            has_v6,
+            table,
+            rule_start,
+            &mut installed,
+        )
+        .await;
+    } else {
+        add_rules_classic(
+            &handle,
+            if_name,
+            cfg,
+            marks,
+            has_v4,
+            has_v6,
+            table,
+            rule_start,
+            &mut installed,
+        )
+        .await;
     }
 
     info!(
         interface = %if_name,
-        table = ?table_opt,
-        routes = prefixes.len(),
-        "tun: auto-route installed"
+        if_index,
+        table,
+        redirect_mode = marks.redirect_mode,
+        output_mark = format!("0x{:x}", marks.output),
+        input_mark = format!("0x{:x}", marks.input),
+        routes = installed.routes.len(),
+        rules = installed.rules.len(),
+        "tun: auto-route via rtnetlink"
     );
+    Ok(installed)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn add_route(
+    handle: &rtnetlink::Handle,
+    if_index: u32,
+    table: u32,
+    dest: &str,
+    v6: bool,
+) -> Result<()> {
+    let (ip_s, pl_s) = dest
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("bad CIDR {dest}"))?;
+    let pl: u8 = pl_s.parse()?;
+    if v6 {
+        let ip: Ipv6Addr = ip_s.parse()?;
+        handle
+            .route()
+            .add()
+            .v6()
+            .destination_prefix(ip, pl)
+            .output_interface(if_index)
+            .table_id(table)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("route add {dest}: {e}"))?;
+    } else {
+        let ip: Ipv4Addr = ip_s.parse()?;
+        handle
+            .route()
+            .add()
+            .v4()
+            .destination_prefix(ip, pl)
+            .output_interface(if_index)
+            .table_id(table)
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("route add {dest}: {e}"))?;
+    }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn add_rules_redirect_mark(
+    handle: &rtnetlink::Handle,
+    marks: TunMarks,
+    has_v4: bool,
+    has_v6: bool,
+    table: u32,
+    rule_start: u32,
+    inst: &mut LinuxInstalled,
+) {
+    use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute};
+
+    let mut prio4 = rule_start;
+    let mut prio6 = rule_start;
+
+    if has_v4 {
+        // output mark → goto prio+2
+        {
+            let prio = prio4;
+            let mut req = handle.rule().add().v4().priority(prio).fw_mark(marks.output);
+            // Goto via action + attribute
+            req = req.action(RuleAction::Goto);
+            {
+                
+                req.message_mut()
+                    .attributes
+                    .push(RuleAttribute::Goto(prio + 2));
+            }
+            match req.execute().await {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(prio, err = %e, "rule4 goto failed"),
+            }
+        }
+        prio4 += 1;
+        // input mark → TUN table
+        {
+            let prio = prio4;
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .fw_mark(marks.input)
+                .table_id(table)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(prio, err = %e, "rule4 input mark failed"),
+            }
+        }
+        prio4 += 1;
+        // nop
+        {
+            let prio = prio4;
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .action(RuleAction::Unspec)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(prio, err = %e, "rule4 nop failed"),
+            }
+        }
+    }
+    if has_v6 {
+        {
+            let prio = prio6;
+            let mut req = handle.rule().add().v6().priority(prio).fw_mark(marks.output);
+            req = req.action(RuleAction::Goto);
+            {
+                
+                req.message_mut()
+                    .attributes
+                    .push(RuleAttribute::Goto(prio + 2));
+            }
+            match req.execute().await {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(prio, err = %e, "rule6 goto failed"),
+            }
+        }
+        prio6 += 1;
+        {
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .fw_mark(marks.input)
+                .table_id(table)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(prio, err = %e, "rule6 input mark failed"),
+            }
+        }
+        prio6 += 1;
+        {
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .action(RuleAction::Unspec)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(prio, err = %e, "rule6 nop failed"),
+            }
+        }
+    }
+
+    let fb = DEFAULT_FALLBACK_RULE_PRIORITY as u32;
+    if has_v4 {
+        match handle
+            .rule()
+            .add()
+            .v4()
+            .priority(fb)
+            .table_id(table)
+            .action(RuleAction::ToTable)
+            .execute()
+            .await
+        {
+            Ok(()) => inst.rules.push((fb, false)),
+            Err(e) => warn!(err = %e, "fallback rule4 failed"),
+        }
+    }
+    if has_v6 {
+        match handle
+            .rule()
+            .add()
+            .v6()
+            .priority(fb)
+            .table_id(table)
+            .action(RuleAction::ToTable)
+            .execute()
+            .await
+        {
+            Ok(()) => inst.rules.push((fb, true)),
+            Err(e) => warn!(err = %e, "fallback rule6 failed"),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn add_rules_classic(
+    handle: &rtnetlink::Handle,
+    if_name: &str,
+    cfg: &TunConfig,
+    marks: TunMarks,
+    has_v4: bool,
+    has_v6: bool,
+    table: u32,
+    rule_start: u32,
+    inst: &mut LinuxInstalled,
+) {
+    use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute};
+
+    let nop = rule_start + 10;
+    let mut prio4 = rule_start;
+    let mut prio6 = rule_start;
+
+    // exclude → main
+    for cidr in &cfg.route_exclude_address {
+        let prio = rule_start.saturating_sub(5);
+        if let Ok((ip, pl)) = parse_v4_cidr(cidr) {
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .destination_prefix(ip, pl)
+                .table_id(254) // main
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(cidr, err = %e, "exclude rule failed"),
+            }
+        }
+    }
+
+    // output mark → main
+    if marks.output != 0 {
+        if has_v4 {
+            let prio = prio4;
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .fw_mark(marks.output)
+                .table_id(254)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(err = %e, "mark→main v4 failed"),
+            }
+            prio4 += 1;
+        }
+        if has_v6 {
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .fw_mark(marks.output)
+                .table_id(254)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "mark→main v6 failed"),
+            }
+            prio6 += 1;
+        }
+    }
+
+    // iif TUN → nop (goto)
+    if has_v4 {
+        let prio = prio4;
+        let mut req = handle
+            .rule()
+            .add()
+            .v4()
+            .priority(prio)
+            .input_interface(if_name.to_string())
+            .action(RuleAction::Goto);
+        {
+            
+            req.message_mut()
+                .attributes
+                .push(RuleAttribute::Goto(nop));
+        }
+        match req.execute().await {
+            Ok(()) => inst.rules.push((prio, false)),
+            Err(e) => warn!(err = %e, "iif tun goto failed"),
+        }
+        prio4 += 1;
+
+        // not iif lo → table TUN  (approximate: all non-lo by installing catch-all after lo-specific)
+        // Catch-all to TUN table
+        let prio = prio4;
+        match handle
+            .rule()
+            .add()
+            .v4()
+            .priority(prio)
+            .table_id(table)
+            .action(RuleAction::ToTable)
+            .execute()
+            .await
+        {
+            Ok(()) => inst.rules.push((prio, false)),
+            Err(e) => warn!(err = %e, "catch-all→tun failed"),
+        }
+        prio4 += 1;
+    }
+    if has_v6 {
+        let prio = prio6;
+        let mut req = handle
+            .rule()
+            .add()
+            .v6()
+            .priority(prio)
+            .input_interface(if_name.to_string())
+            .action(RuleAction::Goto);
+        {
+            
+            req.message_mut()
+                .attributes
+                .push(RuleAttribute::Goto(nop));
+        }
+        match req.execute().await {
+            Ok(()) => inst.rules.push((prio, true)),
+            Err(e) => warn!(err = %e, "iif tun goto6 failed"),
+        }
+        prio6 += 1;
+        let prio = prio6;
+        match handle
+            .rule()
+            .add()
+            .v6()
+            .priority(prio)
+            .table_id(table)
+            .action(RuleAction::ToTable)
+            .execute()
+            .await
+        {
+            Ok(()) => inst.rules.push((prio, true)),
+            Err(e) => warn!(err = %e, "catch-all→tun6 failed"),
+        }
+        prio6 += 1;
+    }
+
+    if cfg.strict_route {
+        if !has_v4 {
+            let prio = prio4;
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .action(RuleAction::Unreachable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(err = %e, "strict unreachable v4 failed"),
+            }
+        }
+        if !has_v6 {
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .action(RuleAction::Unreachable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "strict unreachable v6 failed"),
+            }
+        }
+        info!("tun: strict-route (rtnetlink unreachable)");
+    }
+
+    // nop anchors
+    if has_v4 {
+        match handle
+            .rule()
+            .add()
+            .v4()
+            .priority(nop)
+            .action(RuleAction::Unspec)
+            .execute()
+            .await
+        {
+            Ok(()) => inst.rules.push((nop, false)),
+            Err(e) => warn!(err = %e, "nop4 failed"),
+        }
+    }
+    if has_v6 {
+        match handle
+            .rule()
+            .add()
+            .v6()
+            .priority(nop)
+            .action(RuleAction::Unspec)
+            .execute()
+            .await
+        {
+            Ok(()) => inst.rules.push((nop, true)),
+            Err(e) => warn!(err = %e, "nop6 failed"),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_v4_cidr(s: &str) -> Result<(Ipv4Addr, u8)> {
+    let (ip, pl) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("cidr"))?;
+    Ok((ip.parse()?, pl.parse()?))
 }
 
 #[cfg(target_os = "windows")]
 fn install_windows(
     if_name: &str,
     cfg: &TunConfig,
-    prefixes: &[(String, bool)],
-    guard: &mut RouteGuard,
-) -> Result<()> {
-    for (dest, v6) in prefixes {
+    pfx: &[(String, bool)],
+) -> Result<Vec<(bool, String, String)>> {
+    let mut win = Vec::new();
+    for (dest, v6) in pfx {
         let family = if *v6 { "ipv6" } else { "ipv4" };
-        run_cmd(
-            "netsh",
-            &[
+        let st = std::process::Command::new("netsh")
+            .args([
                 "interface",
                 family,
                 "add",
                 "route",
                 dest,
                 &format!("interface={if_name}"),
-            ],
-        );
-        guard.cleanup.push(CleanupAction::WinRoute {
-            v6: *v6,
-            dest: dest.clone(),
-            if_name: if_name.into(),
-        });
+            ])
+            .status();
+        if st.map(|s| s.success()).unwrap_or(false) {
+            win.push((*v6, dest.clone(), if_name.into()));
+        }
     }
     if cfg.strict_route {
-        info!("tun: strict-route on Windows is best-effort (split default only)");
+        info!("tun: strict-route Windows best-effort");
     }
-    info!(interface = %if_name, routes = prefixes.len(), "tun: auto-route installed");
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn run_ip(args: &[&str]) {
-    match Command::new("ip").args(args).output() {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => warn!(
-            cmd = ?args,
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "ip command failed"
-        ),
-        Err(e) => warn!(cmd = ?args, err = %e, "failed to run ip"),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn run_cmd(bin: &str, args: &[&str]) {
-    match Command::new(bin).args(args).output() {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => warn!(
-            cmd = %bin,
-            args = ?args,
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "command failed"
-        ),
-        Err(e) => warn!(cmd = %bin, err = %e, "failed to run command"),
-    }
+    info!(interface = %if_name, "tun: auto-route (netsh)");
+    Ok(win)
 }

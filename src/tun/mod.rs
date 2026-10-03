@@ -9,6 +9,7 @@
 mod device;
 mod gso;
 mod iface;
+mod marks;
 mod ip_defrag;
 mod nat;
 mod native_tun;
@@ -22,6 +23,11 @@ mod route;
 mod stack;
 
 pub use iface::bind_interface;
+
+/// Output mark for dialers (used by main before TUN starts).
+pub fn marks_resolve(user_mark: u32, auto_route: bool, auto_redirect: bool, auto_detect: bool) -> u32 {
+    marks::TunMarks::resolve(user_mark, auto_route, auto_redirect, auto_detect).output
+}
 
 use crate::app::router::Router;
 use crate::config::Config;
@@ -104,27 +110,48 @@ pub async fn run_tun(
         "tun: device ready"
     );
 
-    // auto-detect-interface: bind outbound to physical default NIC.
+    // Marks (sing-tun dual-mark when auto-redirect). Prefer values set by main.
+    let marks = marks::TunMarks::resolve(
+        crate::app::sockopt::fwmark(),
+        tun_cfg.auto_route,
+        tun_cfg.auto_redirect,
+        tun_cfg.auto_detect_interface,
+    );
+    // Ensure dialer SO_MARK uses output mark.
+    crate::app::sockopt::set_fwmark(marks.output);
+    if marks.redirect_mode {
+        info!(
+            output_mark = format!("0x{:x}", marks.output),
+            input_mark = format!("0x{:x}", marks.input),
+            "tun: dual-mark mode (auto-redirect)"
+        );
+    } else if marks.output != 0 {
+        info!(mark = format!("0x{:x}", marks.output), "tun: route mark");
+    }
+
+    // auto-detect-interface
     if tun_cfg.auto_detect_interface {
         iface::start_monitor(if_name.clone(), true);
     }
 
-    // Effective fwmark (main may have auto-filled a default for TUN anti-loop).
-    let mark = crate::app::sockopt::fwmark();
+    let has_v4 = inet4_server.is_some();
+    let has_v6 = inet6_server.is_some();
 
     // auto-route / strict-route
     let _route_guard = if tun_cfg.auto_route {
         Some(
-            route::install_routes(&if_name, &tun_cfg, mark).context("auto-route")?,
+            route::install_routes(&if_name, &tun_cfg, marks, has_v4, has_v6)
+                .await
+                .context("auto-route")?,
         )
     } else {
         None
     };
 
-    // auto-redirect (Linux only): internal listener + nft/iptables, no redir-port.
+    // auto-redirect: internal listener + nft/iptables (no redir-port)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let _redirect_guard = if tun_cfg.auto_redirect {
-        match redirect::start_auto_redirect(mark, router.clone(), outbounds.clone()).await {
+        match redirect::start_auto_redirect(marks, router.clone(), outbounds.clone()).await {
             Ok(g) => Some(g),
             Err(e) => {
                 warn!("tun: auto-redirect skipped: {e:#}");
@@ -170,7 +197,21 @@ pub async fn run_tun(
     };
 
     // DNS hijack context
-    let dns_hijack = stack::parse_dns_hijack(&tun_cfg.dns_hijack);
+    // dns-hijack: user list + TUN gateway:53 (mihomo behaviour)
+    let mut dns_list = tun_cfg.dns_hijack.clone();
+    if !dns_list.is_empty() {
+        if let Some(a) = inet4_server {
+            // gateway is often addr+1 (client); hijack both server and next
+            dns_list.push(format!("{a}:53"));
+            dns_list.push(format!("{}:53", next_v4(a)));
+        }
+        if let Some(a) = inet6_server {
+            dns_list.push(format!("[{a}]:53"));
+            dns_list.push(format!("[{}]:53", next_v6(a)));
+        }
+        // any:53 already covers all; keep explicit gateways for clarity
+    }
+    let dns_hijack = stack::parse_dns_hijack(&dns_list);
     let (dns_direct, dns_proxy) = if dns_hijack.is_empty() {
         (None, None)
     } else {
@@ -178,6 +219,7 @@ pub async fn run_tun(
             .context("tun dns-hijack: direct-nameserver")?;
         let p = dns::parse_nameserver(&cfg.dns.proxy_nameserver)
             .context("tun dns-hijack: proxy-nameserver")?;
+        info!(rules = dns_hijack.len(), "tun: dns-hijack enabled");
         (Some(Arc::new(d)), Some(Arc::new(p)))
     };
 
