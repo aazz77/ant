@@ -21,7 +21,7 @@ mod redirect;
 mod route;
 mod stack;
 
-pub use iface::{bind_interface, detect_default_interface};
+pub use iface::bind_interface;
 
 use crate::app::router::Router;
 use crate::config::Config;
