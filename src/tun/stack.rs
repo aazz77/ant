@@ -34,16 +34,38 @@ struct UdpEntry {
     last_seen: Instant,
 }
 
-pub async fn run_system_stack(
-    dev: tun::AsyncDevice,
-    if_name: String,
-    cfg: TunConfig,
+/// Addresses derived from `tun.address` for the system stack.
+pub struct StackAddrs {
+    pub inet4_server: Option<Ipv4Addr>,
+    pub inet4_client: Option<Ipv4Addr>,
+    pub inet6_server: Option<Ipv6Addr>,
+    pub inet6_client: Option<Ipv6Addr>,
+    pub prefixes_v4: Vec<(Ipv4Addr, u8)>,
+    pub prefixes_v6: Vec<(Ipv6Addr, u8)>,
+}
+
+/// Shared runtime handles passed through the packet path.
+#[derive(Clone)]
+struct StackRuntime {
+    writer: Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
+    tcp_nat: Arc<TcpNat>,
+    udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
+    router: Arc<Router>,
+    outbounds: Arc<OutboundManager>,
+    tcp_port_v4: u16,
+    tcp_port_v6: u16,
     inet4_server: Option<Ipv4Addr>,
     inet4_client: Option<Ipv4Addr>,
     inet6_server: Option<Ipv6Addr>,
     inet6_client: Option<Ipv6Addr>,
-    prefixes_v4: Vec<(Ipv4Addr, u8)>,
-    _prefixes_v6: Vec<(Ipv6Addr, u8)>,
+    inet4_broadcast: Option<Ipv4Addr>,
+}
+
+pub async fn run_system_stack(
+    dev: tun::AsyncDevice,
+    if_name: String,
+    cfg: TunConfig,
+    addrs: StackAddrs,
     router: Arc<Router>,
     outbounds: Arc<OutboundManager>,
 ) -> Result<()> {
@@ -51,11 +73,11 @@ pub async fn run_system_stack(
     let (mut reader, writer) = tokio::io::split(dev);
     let writer = Arc::new(Mutex::new(writer));
 
-    let tcp_listener_v4 = match inet4_server {
+    let tcp_listener_v4 = match addrs.inet4_server {
         Some(addr) => bind_with_retry(SocketAddr::V4(SocketAddrV4::new(addr, 0))).await,
         None => None,
     };
-    let tcp_listener_v6 = match inet6_server {
+    let tcp_listener_v6 = match addrs.inet6_server {
         Some(addr) => bind_with_retry(SocketAddr::V6(SocketAddrV6::new(addr, 0, 0, 0))).await,
         None => None,
     };
@@ -63,17 +85,19 @@ pub async fn run_system_stack(
     let tcp_port_v4 = tcp_listener_v4
         .as_ref()
         .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port());
+        .map(|a| a.port())
+        .unwrap_or(0);
     let tcp_port_v6 = tcp_listener_v6
         .as_ref()
         .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port());
+        .map(|a| a.port())
+        .unwrap_or(0);
 
-    if let Some(p) = tcp_port_v4 {
-        info!(interface = %if_name, port = p, "tun: TCP v4 listener ready");
+    if tcp_port_v4 != 0 {
+        info!(interface = %if_name, port = tcp_port_v4, "tun: TCP v4 listener ready");
     }
-    if let Some(p) = tcp_port_v6 {
-        info!(interface = %if_name, port = p, "tun: TCP v6 listener ready");
+    if tcp_port_v6 != 0 {
+        info!(interface = %if_name, port = tcp_port_v6, "tun: TCP v6 listener ready");
     }
 
     if let Some(listener) = tcp_listener_v4 {
@@ -110,9 +134,25 @@ pub async fn run_system_stack(
         });
     }
 
-    let inet4_broadcast = prefixes_v4
+    let inet4_broadcast = addrs
+        .prefixes_v4
         .first()
         .map(|(net, pl)| broadcast_addr_v4(*net, *pl));
+
+    let rt = StackRuntime {
+        writer,
+        tcp_nat,
+        udp_sessions,
+        router,
+        outbounds,
+        tcp_port_v4,
+        tcp_port_v6,
+        inet4_server: addrs.inet4_server,
+        inet4_client: addrs.inet4_client,
+        inet6_server: addrs.inet6_server,
+        inet6_client: addrs.inet6_client,
+        inet4_broadcast,
+    };
 
     let mut buf = vec![0u8; (cfg.mtu as usize).saturating_add(64).max(2048)];
     loop {
@@ -133,35 +173,8 @@ pub async fn run_system_stack(
         }
         let pkt = &buf[..n];
         match pkt[0] >> 4 {
-            4 => {
-                process_ipv4(
-                    pkt,
-                    inet4_server,
-                    inet4_client,
-                    inet4_broadcast,
-                    tcp_port_v4.unwrap_or(0),
-                    writer.clone(),
-                    tcp_nat.clone(),
-                    udp_sessions.clone(),
-                    router.clone(),
-                    outbounds.clone(),
-                )
-                .await;
-            }
-            6 if n >= 40 => {
-                process_ipv6(
-                    pkt,
-                    inet6_server,
-                    inet6_client,
-                    tcp_port_v6.unwrap_or(0),
-                    writer.clone(),
-                    tcp_nat.clone(),
-                    udp_sessions.clone(),
-                    router.clone(),
-                    outbounds.clone(),
-                )
-                .await;
-            }
+            4 => process_ipv4(pkt, &rt).await,
+            6 if n >= 40 => process_ipv6(pkt, &rt).await,
             _ => {}
         }
     }
@@ -248,18 +261,7 @@ async fn handle_tcp(
     Ok(())
 }
 
-async fn process_ipv4(
-    raw: &[u8],
-    inet4_server: Option<Ipv4Addr>,
-    inet4_client: Option<Ipv4Addr>,
-    inet4_broadcast: Option<Ipv4Addr>,
-    tcp_port: u16,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
-    tcp_nat: Arc<TcpNat>,
-    udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
-    router: Arc<Router>,
-    outbounds: Arc<OutboundManager>,
-) {
+async fn process_ipv4(raw: &[u8], rt: &StackRuntime) {
     if raw.len() < 20 {
         return;
     }
@@ -274,27 +276,21 @@ async fn process_ipv4(
 
     let src_ip = Ipv4Addr::from([raw[12], raw[13], raw[14], raw[15]]);
     let dst_ip = Ipv4Addr::from([raw[16], raw[17], raw[18], raw[19]]);
-    if Some(dst_ip) == inet4_broadcast {
+    if Some(dst_ip) == rt.inet4_broadcast {
         return;
     }
     let payload = &raw[ihl..];
     match raw[9] {
-        IPPROTO_TCP if tcp_port != 0 => {
-            handle_tcp_v4(
-                raw, payload, src_ip, dst_ip, inet4_server, inet4_client, tcp_port, writer, tcp_nat,
-            )
-            .await;
+        IPPROTO_TCP if rt.tcp_port_v4 != 0 => {
+            handle_tcp_v4(raw, payload, src_ip, dst_ip, rt).await;
         }
         IPPROTO_UDP => {
             handle_udp(
                 payload,
-                SocketAddr::V4(SocketAddrV4::new(src_ip, 0)), // ports filled below
+                SocketAddr::V4(SocketAddrV4::new(src_ip, 0)),
                 SocketAddr::V4(SocketAddrV4::new(dst_ip, 0)),
                 true,
-                writer,
-                udp_sessions,
-                router,
-                outbounds,
+                rt,
             )
             .await;
         }
@@ -302,17 +298,7 @@ async fn process_ipv4(
     }
 }
 
-async fn process_ipv6(
-    raw: &[u8],
-    inet6_server: Option<Ipv6Addr>,
-    inet6_client: Option<Ipv6Addr>,
-    tcp_port: u16,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
-    tcp_nat: Arc<TcpNat>,
-    udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
-    router: Arc<Router>,
-    outbounds: Arc<OutboundManager>,
-) {
+async fn process_ipv6(raw: &[u8], rt: &StackRuntime) {
     if raw.len() < 40 {
         return;
     }
@@ -321,11 +307,8 @@ async fn process_ipv6(
     let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&raw[24..40]).unwrap());
     let payload = &raw[40..];
     match next {
-        IPPROTO_TCP if tcp_port != 0 => {
-            handle_tcp_v6(
-                raw, payload, src_ip, dst_ip, inet6_server, inet6_client, tcp_port, writer, tcp_nat,
-            )
-            .await;
+        IPPROTO_TCP if rt.tcp_port_v6 != 0 => {
+            handle_tcp_v6(raw, payload, src_ip, dst_ip, rt).await;
         }
         IPPROTO_UDP => {
             handle_udp(
@@ -333,10 +316,7 @@ async fn process_ipv6(
                 SocketAddr::V6(SocketAddrV6::new(src_ip, 0, 0, 0)),
                 SocketAddr::V6(SocketAddrV6::new(dst_ip, 0, 0, 0)),
                 false,
-                writer,
-                udp_sessions,
-                router,
-                outbounds,
+                rt,
             )
             .await;
         }
@@ -349,13 +329,9 @@ async fn handle_tcp_v4(
     tcp_payload: &[u8],
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
-    inet4_server: Option<Ipv4Addr>,
-    inet4_client: Option<Ipv4Addr>,
-    tcp_port: u16,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send>>,
-    tcp_nat: Arc<TcpNat>,
+    rt: &StackRuntime,
 ) {
-    let (server_addr, client_addr) = match (inet4_server, inet4_client) {
+    let (server_addr, client_addr) = match (rt.inet4_server, rt.inet4_client) {
         (Some(s), Some(c)) => (s, c),
         _ => return,
     };
@@ -365,9 +341,10 @@ async fn handle_tcp_v4(
     let ihl = ((raw[0] & 0x0f) as usize) * 4;
     let src_port = u16::from_be_bytes([tcp_payload[0], tcp_payload[1]]);
     let dst_port = u16::from_be_bytes([tcp_payload[2], tcp_payload[3]]);
+    let tcp_port = rt.tcp_port_v4;
 
     if src_ip == server_addr && src_port == tcp_port {
-        if let Some((orig_src, orig_dst)) = tcp_nat.lookup_back(dst_port).await {
+        if let Some((orig_src, orig_dst)) = rt.tcp_nat.lookup_back(dst_port).await {
             let mut pkt = raw.to_vec();
             let (ns, nsp) = match orig_dst {
                 SocketAddr::V4(a) => (*a.ip(), a.port()),
@@ -383,7 +360,7 @@ async fn handle_tcp_v4(
             pkt[ihl + 2..ihl + 4].copy_from_slice(&ndp.to_be_bytes());
             recompute_tcp_checksum_v4(&mut pkt, ihl);
             recompute_ipv4_checksum(&mut pkt);
-            tun_write(&writer, &pkt).await;
+            tun_write(&rt.writer, &pkt).await;
         }
         return;
     }
@@ -394,7 +371,7 @@ async fn handle_tcp_v4(
 
     let src = SocketAddr::V4(SocketAddrV4::new(src_ip, src_port));
     let dst = SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port));
-    let Some(nat_port) = tcp_nat.lookup_or_insert(src, dst).await else {
+    let Some(nat_port) = rt.tcp_nat.lookup_or_insert(src, dst).await else {
         warn!("tun: TCP NAT port space exhausted");
         return;
     };
@@ -406,7 +383,7 @@ async fn handle_tcp_v4(
     pkt[ihl + 2..ihl + 4].copy_from_slice(&tcp_port.to_be_bytes());
     recompute_tcp_checksum_v4(&mut pkt, ihl);
     recompute_ipv4_checksum(&mut pkt);
-    tun_write(&writer, &pkt).await;
+    tun_write(&rt.writer, &pkt).await;
 }
 
 async fn handle_tcp_v6(
@@ -414,13 +391,9 @@ async fn handle_tcp_v6(
     tcp_payload: &[u8],
     src_ip: Ipv6Addr,
     dst_ip: Ipv6Addr,
-    inet6_server: Option<Ipv6Addr>,
-    inet6_client: Option<Ipv6Addr>,
-    tcp_port: u16,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send>>,
-    tcp_nat: Arc<TcpNat>,
+    rt: &StackRuntime,
 ) {
-    let (server_addr, client_addr) = match (inet6_server, inet6_client) {
+    let (server_addr, client_addr) = match (rt.inet6_server, rt.inet6_client) {
         (Some(s), Some(c)) => (s, c),
         _ => return,
     };
@@ -430,9 +403,10 @@ async fn handle_tcp_v6(
     let tcp_off = 40;
     let src_port = u16::from_be_bytes([tcp_payload[0], tcp_payload[1]]);
     let dst_port = u16::from_be_bytes([tcp_payload[2], tcp_payload[3]]);
+    let tcp_port = rt.tcp_port_v6;
 
     if src_ip == server_addr && src_port == tcp_port {
-        if let Some((orig_src, orig_dst)) = tcp_nat.lookup_back(dst_port).await {
+        if let Some((orig_src, orig_dst)) = rt.tcp_nat.lookup_back(dst_port).await {
             let mut pkt = raw.to_vec();
             let (ns, nsp) = match orig_dst {
                 SocketAddr::V6(a) => (*a.ip(), a.port()),
@@ -447,7 +421,7 @@ async fn handle_tcp_v6(
             pkt[tcp_off..tcp_off + 2].copy_from_slice(&nsp.to_be_bytes());
             pkt[tcp_off + 2..tcp_off + 4].copy_from_slice(&ndp.to_be_bytes());
             recompute_tcp_checksum_v6(&mut pkt, tcp_off);
-            tun_write(&writer, &pkt).await;
+            tun_write(&rt.writer, &pkt).await;
         }
         return;
     }
@@ -458,7 +432,7 @@ async fn handle_tcp_v6(
 
     let src = SocketAddr::V6(SocketAddrV6::new(src_ip, src_port, 0, 0));
     let dst = SocketAddr::V6(SocketAddrV6::new(dst_ip, dst_port, 0, 0));
-    let Some(nat_port) = tcp_nat.lookup_or_insert(src, dst).await else {
+    let Some(nat_port) = rt.tcp_nat.lookup_or_insert(src, dst).await else {
         warn!("tun: TCP NAT port space exhausted (v6)");
         return;
     };
@@ -469,7 +443,7 @@ async fn handle_tcp_v6(
     pkt[tcp_off..tcp_off + 2].copy_from_slice(&nat_port.to_be_bytes());
     pkt[tcp_off + 2..tcp_off + 4].copy_from_slice(&tcp_port.to_be_bytes());
     recompute_tcp_checksum_v6(&mut pkt, tcp_off);
-    tun_write(&writer, &pkt).await;
+    tun_write(&rt.writer, &pkt).await;
 }
 
 async fn handle_udp(
@@ -477,10 +451,7 @@ async fn handle_udp(
     mut src: SocketAddr,
     mut dst: SocketAddr,
     is_v4: bool,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
-    udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
-    router: Arc<Router>,
-    outbounds: Arc<OutboundManager>,
+    rt: &StackRuntime,
 ) {
     if udp_payload.len() < 8 {
         return;
@@ -503,20 +474,12 @@ async fn handle_udp(
     }
 
     let data = Bytes::copy_from_slice(&udp_payload[8..]);
-    feed_udp(src, dst, data, writer, udp_sessions, router, outbounds).await;
+    feed_udp(src, dst, data, rt).await;
 }
 
-async fn feed_udp(
-    src: SocketAddr,
-    dst: SocketAddr,
-    data: Bytes,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
-    udp_sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
-    router: Arc<Router>,
-    outbounds: Arc<OutboundManager>,
-) {
+async fn feed_udp(src: SocketAddr, dst: SocketAddr, data: Bytes, rt: &StackRuntime) {
     {
-        let mut map = udp_sessions.lock().await;
+        let mut map = rt.udp_sessions.lock().await;
         if let Some(e) = map.get_mut(&src) {
             e.last_seen = Instant::now();
             let _ = e.packet_tx.try_send((data, dst));
@@ -534,7 +497,10 @@ async fn feed_udp(
         );
         drop(map);
 
-        let sessions = udp_sessions.clone();
+        let writer = rt.writer.clone();
+        let sessions = rt.udp_sessions.clone();
+        let router = rt.router.clone();
+        let outbounds = rt.outbounds.clone();
         tokio::spawn(async move {
             run_udp_session(src, rx, writer, sessions, router, outbounds).await;
         });
@@ -544,7 +510,7 @@ async fn feed_udp(
 async fn run_udp_session(
     client: SocketAddr,
     mut rx: mpsc::Receiver<UdpPacket>,
-    writer: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
+    writer: Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
     sessions: Arc<Mutex<HashMap<SocketAddr, UdpEntry>>>,
     router: Arc<Router>,
     outbounds: Arc<OutboundManager>,
@@ -575,19 +541,13 @@ async fn run_udp_session(
     let sess_r = sess.clone();
     let writer_r = writer.clone();
     let recv_task = tokio::spawn(async move {
-        loop {
-            match sess_r.recv_from().await {
-                Ok((payload, from)) => {
-                    if let Some(pkt) = build_udp_reply(from, client, &payload) {
-                        tun_write(&writer_r, &pkt).await;
-                    }
-                }
-                Err(_) => break,
+        while let Ok((payload, from)) = sess_r.recv_from().await {
+            if let Some(pkt) = build_udp_reply(from, client, &payload) {
+                tun_write(&writer_r, &pkt).await;
             }
         }
     });
 
-    // First packet
     if let Err(e) = sess
         .send_to(&first_payload, first_dst, decided.host.as_deref())
         .await
@@ -598,18 +558,13 @@ async fn run_udp_session(
         return;
     }
 
-    loop {
-        match tokio::time::timeout(UDP_IDLE, rx.recv()).await {
-            Ok(Some((payload, dest))) => {
-                if let Some(e) = sessions.lock().await.get_mut(&client) {
-                    e.last_seen = Instant::now();
-                }
-                if let Err(e) = sess.send_to(&payload, dest, None).await {
-                    debug!(err = %e, "tun: udp send failed");
-                    break;
-                }
-            }
-            Ok(None) | Err(_) => break,
+    while let Ok(Some((payload, dest))) = tokio::time::timeout(UDP_IDLE, rx.recv()).await {
+        if let Some(e) = sessions.lock().await.get_mut(&client) {
+            e.last_seen = Instant::now();
+        }
+        if let Err(e) = sess.send_to(&payload, dest, None).await {
+            debug!(err = %e, "tun: udp send failed");
+            break;
         }
     }
 
@@ -617,7 +572,10 @@ async fn run_udp_session(
     sessions.lock().await.remove(&client);
 }
 
-async fn tun_write(writer: &Arc<Mutex<impl AsyncWriteExt + Unpin>>, pkt: &[u8]) {
+async fn tun_write(
+    writer: &Arc<Mutex<tokio::io::WriteHalf<tun::AsyncDevice>>>,
+    pkt: &[u8],
+) {
     let mut w = writer.lock().await;
     if let Err(e) = w.write_all(pkt).await {
         debug!(err = %e, "tun: write failed");
