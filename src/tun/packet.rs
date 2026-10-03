@@ -272,6 +272,7 @@ pub fn build_tcp_rst_v6(
     pkt
 }
 
+#[cfg(not(unix))]
 pub fn build_icmp_echo_reply_v4(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.len() < 28 {
         return None;
@@ -298,6 +299,7 @@ pub fn build_icmp_echo_reply_v4(raw: &[u8]) -> Option<Vec<u8>> {
     Some(pkt)
 }
 
+#[cfg(not(unix))]
 pub fn build_icmp_echo_reply_v6(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.len() < 48 || raw[6] != 58 || raw[40] != 128 {
         return None;

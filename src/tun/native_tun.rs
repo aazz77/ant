@@ -169,7 +169,7 @@ impl NativeTunWriter {
             return Ok(());
         }
         if !self.gro_enabled {
-            let batch: Vec<Vec<u8>> = self.pending.drain(..).collect();
+            let batch = std::mem::take(&mut self.pending);
             for p in batch {
                 self.write_raw_ip(&p).await?;
             }

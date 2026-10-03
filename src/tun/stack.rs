@@ -69,16 +69,28 @@ struct StackRuntime {
     icmp: Option<Arc<super::icmp_forwarder::IcmpForwarder>>,
 }
 
-pub async fn run_system_stack(
-    dev: tun::AsyncDevice,
-    if_name: String,
-    cfg: TunConfig,
-    addrs: StackAddrs,
-    router: Arc<Router>,
-    outbounds: Arc<OutboundManager>,
-    vnet_hdr: bool,
-    gro_flags: GroDisablementFlags,
-) -> Result<()> {
+pub struct TunStackParams {
+    pub dev: tun::AsyncDevice,
+    pub if_name: String,
+    pub cfg: TunConfig,
+    pub addrs: StackAddrs,
+    pub router: Arc<Router>,
+    pub outbounds: Arc<OutboundManager>,
+    pub vnet_hdr: bool,
+    pub gro_flags: GroDisablementFlags,
+}
+
+pub async fn run_system_stack(p: TunStackParams) -> Result<()> {
+    let TunStackParams {
+        dev,
+        if_name,
+        cfg,
+        addrs,
+        router,
+        outbounds,
+        vnet_hdr,
+        gro_flags,
+    } = p;
     let tcp_nat = Arc::new(TcpNat::new());
     let native = NativeTun::new(dev, vnet_hdr, gro_flags);
     let (reader, writer) = native.split();
@@ -331,9 +343,14 @@ async fn process_ipv4(raw: &[u8], rt: &StackRuntime) {
         }
         IPPROTO_ICMP => {
             #[cfg(unix)]
-            if let Some(ref icmp) = rt.icmp {
-                if icmp.handle_packet(raw).await {
-                    return;
+            {
+                let handled = if let Some(ref icmp) = rt.icmp {
+                    icmp.handle_packet(raw).await
+                } else {
+                    false
+                };
+                if !handled {
+                    // forwarder only handles echo request; other ICMP ignored
                 }
             }
             #[cfg(not(unix))]
@@ -366,10 +383,12 @@ async fn process_ipv6(raw: &[u8], rt: &StackRuntime) {
         }
         IPPROTO_ICMPV6 => {
             #[cfg(unix)]
-            if let Some(ref icmp) = rt.icmp {
-                if icmp.handle_packet(raw).await {
-                    return;
-                }
+            {
+                let _handled = if let Some(ref icmp) = rt.icmp {
+                    icmp.handle_packet(raw).await
+                } else {
+                    false
+                };
             }
             #[cfg(not(unix))]
             if let Some(reply) = build_icmp_echo_reply_v6(raw) {

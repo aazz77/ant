@@ -133,11 +133,11 @@ pub async fn run_tun(
     // Brief wait so the OS registers the address before we bind listeners.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    stack::run_system_stack(
+    stack::run_system_stack(stack::TunStackParams {
         dev,
         if_name,
         cfg,
-        stack::StackAddrs {
+        addrs: stack::StackAddrs {
             inet4_server,
             inet4_client,
             inet6_server,
@@ -148,7 +148,7 @@ pub async fn run_tun(
         outbounds,
         vnet_hdr,
         gro_flags,
-    )
+    })
     .await
 }
 
