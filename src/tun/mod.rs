@@ -109,20 +109,22 @@ pub async fn run_tun(
         iface::start_monitor(if_name.clone(), true);
     }
 
+    // Effective fwmark (main may have auto-filled a default for TUN anti-loop).
+    let mark = crate::app::sockopt::fwmark();
+
     // auto-route / strict-route
     let _route_guard = if tun_cfg.auto_route {
         Some(
-            route::install_routes(&if_name, &tun_cfg, cfg.global.mark)
-                .context("auto-route")?,
+            route::install_routes(&if_name, &tun_cfg, mark).context("auto-route")?,
         )
     } else {
         None
     };
 
-    // auto-redirect (Linux only)
+    // auto-redirect (Linux only): internal listener + nft/iptables, no redir-port.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let _redirect_guard = if tun_cfg.auto_redirect {
-        match redirect::install_redirect(cfg.global.redir_port, cfg.global.mark) {
+        match redirect::start_auto_redirect(mark, router.clone(), outbounds.clone()).await {
             Ok(g) => Some(g),
             Err(e) => {
                 warn!("tun: auto-redirect skipped: {e:#}");
