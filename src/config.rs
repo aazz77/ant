@@ -56,9 +56,9 @@ pub struct TunConfig {
     /// Windows: best-effort (mark/route still required for full isolation).
     #[serde(default, rename = "auto-detect-interface")]
     pub auto_detect_interface: bool,
-    /// Linux only: install nftables/iptables REDIRECT for TCP onto an *internal*
-    /// listener (mihomo-style). Does **not** require `redir-port`. UDP still
-    /// goes through TUN via auto-route. Ignored on non-Linux.
+    /// Linux only: mihomo/sing-tun style auto-redirect (internal listener + nft/iptables).
+    /// Enables dual-mark mode with auto-route. Does **not** require `redir-port`.
+    /// UDP still uses TUN auto-route. Ignored on non-Linux.
     #[serde(default, rename = "auto-redirect")]
     pub auto_redirect: bool,
     /// Stronger anti-leak routing on top of auto-route (Linux). May break LAN reachability.

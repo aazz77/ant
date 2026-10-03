@@ -98,20 +98,22 @@ async fn main() -> Result<()> {
 
     tracing::info!("ant starting, config={}", cli.config);
 
-    // Auto mark for TUN anti-loop when user left mark at 0.
-    // Default 255 matches common clash/mihomo examples.
-    const DEFAULT_TUN_MARK: u32 = 255;
-    let mut mark = cfg.global.mark;
-    if mark == 0
-        && cfg.tun.enable
-        && (cfg.tun.auto_route || cfg.tun.auto_redirect || cfg.tun.auto_detect_interface)
-    {
-        mark = DEFAULT_TUN_MARK;
-        tracing::info!(
-            mark,
-            "mark not set; using default {mark} for TUN anti-loop (auto-route/redirect/detect-interface)"
+    // Resolve SO_MARK: dual-mark when tun.auto-redirect, else single route mark.
+    // Applied again inside tun::run_tun with the same logic for consistency.
+    let mark = if cfg.tun.enable {
+        let m = tun::marks_resolve(
+            cfg.global.mark,
+            cfg.tun.auto_route,
+            cfg.tun.auto_redirect,
+            cfg.tun.auto_detect_interface,
         );
-    }
+        if m != 0 && cfg.global.mark == 0 {
+            tracing::info!(mark = format!("0x{m:x}"), "TUN auto mark (user mark was 0)");
+        }
+        m
+    } else {
+        cfg.global.mark
+    };
     app::sockopt::set_fwmark(mark);
     let bind = cfg.global.bind_address.clone();
     tracing::info!("bind-address={bind}");
