@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 mod app;
