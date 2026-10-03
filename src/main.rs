@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
     }
 
     if cfg.dns.port > 0 {
-        let c = Arc::new(cfg.clone());
+        let c = cfg.clone();
         let r = router.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = dns::run_dns_server(c, r).await {
