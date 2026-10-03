@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    let cfg = Config::load(&cli.config)?;
+    let cfg = std::sync::Arc::new(Config::load(&cli.config)?);
     // 注册 bootstrap 上游（default-nameserver，纯 IP）。这里只做内存注册，
     // 不发起任何网络请求：所有域名解析都推迟到实际使用点（DNS 查询 / 拨号），
     // 失败仅影响当次操作并自然重试，绝不阻塞或终止启动。
@@ -147,14 +147,14 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // TUN: Linux / Android / Windows. No auto_route — user routes traffic in.
+    // TUN: Linux / Android / Windows (system stack + optional auto-route/dns-hijack).
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     if cfg.tun.enable {
         let r = router.clone();
         let o = outbounds.clone();
-        let tun_cfg = cfg.tun.clone();
+        let c = cfg.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = tun::run_tun(tun_cfg, r, o).await {
+            if let Err(e) = tun::run_tun(c, r, o).await {
                 tracing::error!("tun inbound exited: {e:#}");
             }
         }));

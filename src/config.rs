@@ -11,7 +11,7 @@ pub struct Config {
     #[serde(flatten)]
     pub global: GlobalConfig,
     pub dns: DnsConfig,
-    /// TUN virtual NIC (optional). System stack only; no auto_route.
+    /// TUN virtual NIC (optional). System stack + optional OS route/DNS integration.
     #[serde(default)]
     pub tun: TunConfig,
     /// Proxy nodes: list under `proxies:`; each node has a unique `name`.
@@ -27,7 +27,8 @@ pub struct Config {
 
 
 /// Flat `tun:` block. Creates a virtual NIC and runs the system stack.
-/// Does **not** install routes — the user must route traffic into the device.
+/// Optional OS integration: dns-hijack / auto-route / auto-detect-interface /
+/// auto-redirect (Linux) / strict-route — see field docs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TunConfig {
     /// Master switch. Default false.
@@ -43,6 +44,38 @@ pub struct TunConfig {
     /// MTU. Default 1500.
     #[serde(default = "default_tun_mtu")]
     pub mtu: u32,
+    /// DNS destinations to intercept inside the TUN stack, e.g. `any:53`, `0.0.0.0:53`.
+    /// Matched UDP/TCP port-53 queries are answered by the local DNS module.
+    #[serde(default, rename = "dns-hijack")]
+    pub dns_hijack: Vec<String>,
+    /// Install routes so traffic enters the TUN device (Linux `ip` / Windows `netsh`).
+    #[serde(default, rename = "auto-route")]
+    pub auto_route: bool,
+    /// Bind outbound sockets to the current default physical interface so proxy
+    /// traffic does not re-enter TUN (loop prevention). Linux: SO_BINDTODEVICE;
+    /// Windows: best-effort (mark/route still required for full isolation).
+    #[serde(default, rename = "auto-detect-interface")]
+    pub auto_detect_interface: bool,
+    /// Linux only: install nftables/iptables REDIRECT rules to `redir-port`.
+    /// Requires `redir-port` > 0. Ignored on non-Linux.
+    #[serde(default, rename = "auto-redirect")]
+    pub auto_redirect: bool,
+    /// Stronger anti-leak routing on top of auto-route (Linux). May break LAN reachability.
+    #[serde(default, rename = "strict-route")]
+    pub strict_route: bool,
+    /// Custom prefixes routed into TUN when auto-route is on. Empty → split default
+    /// (`0.0.0.0/1`+`128.0.0.0/1` and IPv6 equivalents).
+    #[serde(default, rename = "route-address")]
+    pub route_address: Vec<String>,
+    /// Prefixes excluded from auto-route (not installed / explicitly deleted).
+    #[serde(default, rename = "route-exclude-address")]
+    pub route_exclude_address: Vec<String>,
+    /// iproute2 table index for policy routing (Linux). Default 1982.
+    #[serde(default = "default_tun_table", rename = "iproute2-table-index")]
+    pub iproute2_table_index: i32,
+    /// iproute2 rule priority (Linux). Default 9000.
+    #[serde(default = "default_tun_rule", rename = "iproute2-rule-index")]
+    pub iproute2_rule_index: i32,
 }
 
 impl Default for TunConfig {
@@ -52,8 +85,25 @@ impl Default for TunConfig {
             device: None,
             address: Vec::new(),
             mtu: default_tun_mtu(),
+            dns_hijack: Vec::new(),
+            auto_route: false,
+            auto_detect_interface: false,
+            auto_redirect: false,
+            strict_route: false,
+            route_address: Vec::new(),
+            route_exclude_address: Vec::new(),
+            iproute2_table_index: default_tun_table(),
+            iproute2_rule_index: default_tun_rule(),
         }
     }
+}
+
+fn default_tun_table() -> i32 {
+    1982
+}
+
+fn default_tun_rule() -> i32 {
+    9000
 }
 
 fn default_tun_mtu() -> u32 {
