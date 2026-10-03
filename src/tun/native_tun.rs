@@ -45,7 +45,7 @@ impl NativeTun {
             writer: Arc::new(Mutex::new(NativeTunWriter {
                 inner: Box::pin(w),
                 vnet_hdr,
-                /// Userspace GRO is useful on all platforms (including Windows).
+                // Userspace GRO is useful on all platforms (including Windows).
                 gro_enabled: true,
                 gro_flags,
                 tcp_table: TcpGroTable::new(),
@@ -169,8 +169,8 @@ impl NativeTunWriter {
             return Ok(());
         }
         if !self.gro_enabled {
-            for p in self.pending.drain(..) {
-                // pending without scratch when gro disabled — treat as pure IP
+            let batch: Vec<Vec<u8>> = self.pending.drain(..).collect();
+            for p in batch {
                 self.write_raw_ip(&p).await?;
             }
             return Ok(());

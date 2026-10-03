@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const ICMP_FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 const ICMP_SEND_QUEUE: usize = 64;
@@ -235,7 +235,23 @@ async fn run_icmp_flow(
             ready = async_fd.readable() => {
                 let mut guard = ready?;
                 let mut buf = vec![0u8; 65535];
-                let result = guard.try_io(|inner| inner.get_ref().recv(&mut buf));
+                let result = guard.try_io(|inner| {
+                    use std::os::fd::AsRawFd;
+                    let fd = inner.get_ref().as_raw_fd();
+                    let n = unsafe {
+                        libc::recv(
+                            fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                            0,
+                        )
+                    };
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                });
                 match result {
                     Ok(Ok(n)) if n > 0 => {
                         buf.truncate(n);
@@ -270,7 +286,7 @@ fn build_reply_to_tun(
         if template.len() < 48 {
             return None;
         }
-        let mut pkt = template.clone();
+        let mut pkt = template.to_vec();
         // swap src/dst
         if let (IpAddr::V6(src), IpAddr::V6(dst)) = (key.src, key.dst) {
             pkt[8..24].copy_from_slice(&dst.octets()); // reply src = original dst
