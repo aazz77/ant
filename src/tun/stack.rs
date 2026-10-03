@@ -41,7 +41,6 @@ pub struct StackAddrs {
     pub inet6_server: Option<Ipv6Addr>,
     pub inet6_client: Option<Ipv6Addr>,
     pub prefixes_v4: Vec<(Ipv4Addr, u8)>,
-    pub prefixes_v6: Vec<(Ipv6Addr, u8)>,
 }
 
 /// Shared runtime handles passed through the packet path.

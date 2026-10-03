@@ -107,7 +107,6 @@ pub async fn run_tun(
             inet6_server,
             inet6_client,
             prefixes_v4,
-            prefixes_v6,
         },
         router,
         outbounds,
