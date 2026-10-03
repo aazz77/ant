@@ -1,15 +1,23 @@
-//! auto-route / strict-route via rtnetlink (Linux) + netsh (Windows).
+//! auto-route / strict-route — **faithful port of sing-tun NativeTun.rules()**.
 //!
-//! Critical for servers: ESTABLISHED/RELATED OUTPUT packets are marked with the
-//! outbound fwmark so SSH and other inbound-service replies stay on the main
-//! table and are not blackholed into TUN.
+//! Classic mode (no auto-redirect) uses the mihomo topology that keeps the host
+//! reachable without ESTABLISHED hacks:
+//!
+//! 1. non-DNS → lookup main with suppress_prefixlength 0 (skip default routes)
+//! 2. iif TUN → nop
+//! 3. **not iif lo** → TUN table   (forwarded only; local SSH replies stay local)
+//! 4. iif lo from 0.0.0.0/32 → TUN (unbound local clients)
+//! 5. iif lo from <tun-addrs> → TUN
+//! 6. fall through → main (bound local replies e.g. SSH)
+//!
+//! AutoRedirectMarkMode uses dual fwmark like sing-tun.
 
 use crate::config::TunConfig;
 use crate::tun::marks::{
     TunMarks, DEFAULT_FALLBACK_RULE_PRIORITY, DEFAULT_RULE_PRIORITY, DEFAULT_TABLE,
 };
 use anyhow::{Context, Result};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use tracing::{info, warn};
 
@@ -25,12 +33,8 @@ struct LinuxInstalled {
     #[allow(dead_code)]
     if_index: u32,
     table: u32,
-    output_mark: u32,
     routes: Vec<(bool, String)>,
-    /// (priority, is_v6)
     rules: Vec<(u32, bool)>,
-    /// mangle OUTPUT ESTABLISHED protect installed
-    mangle_protect: bool,
 }
 
 impl Drop for RouteGuard {
@@ -61,9 +65,6 @@ impl Drop for RouteGuard {
                     let _ = cmd
                         .args(["rule", "del", "priority", &prio.to_string()])
                         .output();
-                }
-                if inst.mangle_protect {
-                    remove_established_protect(inst.output_mark);
                 }
             }
         }
@@ -108,7 +109,7 @@ fn prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
             let (ip, pl) = s
                 .split_once('/')
                 .ok_or_else(|| anyhow::anyhow!("route-address CIDR required: {s}"))?;
-            let _: std::net::IpAddr = ip.parse().context("route-address")?;
+            let _: IpAddr = ip.parse().context("route-address")?;
             let pl: u8 = pl.parse().context("prefix")?;
             let v6 = s.contains(':');
             if pl > if v6 { 128 } else { 32 } {
@@ -118,6 +119,34 @@ fn prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
         }
     }
     Ok(out)
+}
+
+/// Parse TUN interface address CIDRs from config for lo-src rules.
+fn tun_address_prefixes(cfg: &TunConfig) -> (Vec<(Ipv4Addr, u8)>, Vec<(Ipv6Addr, u8)>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for s in &cfg.address {
+        let Some((ip_s, pl_s)) = s.split_once('/') else {
+            continue;
+        };
+        let Ok(pl) = pl_s.parse::<u8>() else {
+            continue;
+        };
+        if let Ok(ip) = ip_s.parse::<Ipv4Addr>() {
+            // Masked network like sing-tun address.Masked()
+            let mask = if pl == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - pl)
+            };
+            let net = Ipv4Addr::from(u32::from(ip) & mask);
+            v4.push((net, pl));
+            v4.push((ip, 32)); // also host address
+        } else if let Ok(ip) = ip_s.parse::<Ipv6Addr>() {
+            v6.push((ip, pl.min(128)));
+        }
+    }
+    (v4, v6)
 }
 
 #[allow(clippy::needless_return)]
@@ -154,91 +183,6 @@ pub async fn install_routes(
     }
 }
 
-/// Mark ESTABLISHED/RELATED OUTPUT so inbound-service replies (SSH, etc.) use
-/// main table via the fwmark→main rule. Without this, replies match
-/// "unmarked → TUN" and the host becomes unreachable.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn install_established_protect(mark: u32) -> bool {
-    let mark_s = mark.to_string();
-    let mut ok = false;
-    for bin in ["iptables", "ip6tables"] {
-        let st = Command::new(bin)
-            .args([
-                "-t",
-                "mangle",
-                "-C",
-                "OUTPUT",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "MARK",
-                "--set-mark",
-                &mark_s,
-            ])
-            .status();
-        // -C succeeds if rule already exists
-        if st.map(|s| s.success()).unwrap_or(false) {
-            ok = true;
-            continue;
-        }
-        let st = Command::new(bin)
-            .args([
-                "-t",
-                "mangle",
-                "-I",
-                "OUTPUT",
-                "1",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "MARK",
-                "--set-mark",
-                &mark_s,
-            ])
-            .status();
-        if st.map(|s| s.success()).unwrap_or(false) {
-            ok = true;
-            info!(bin, mark = format!("0x{mark:x}"), "tun: ESTABLISHED/RELATED OUTPUT mark protect");
-        } else {
-            warn!(bin, "tun: failed to install ESTABLISHED protect — SSH may break");
-        }
-    }
-    ok
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn remove_established_protect(mark: u32) {
-    let mark_s = mark.to_string();
-    for bin in ["iptables", "ip6tables"] {
-        // Delete repeatedly in case duplicates
-        for _ in 0..4 {
-            let st = Command::new(bin)
-                .args([
-                    "-t",
-                    "mangle",
-                    "-D",
-                    "OUTPUT",
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "ESTABLISHED,RELATED",
-                    "-j",
-                    "MARK",
-                    "--set-mark",
-                    &mark_s,
-                ])
-                .status();
-            if !st.map(|s| s.success()).unwrap_or(false) {
-                break;
-            }
-        }
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 async fn install_linux(
     if_name: &str,
@@ -249,7 +193,6 @@ async fn install_linux(
     pfx: &[(String, bool)],
 ) -> Result<LinuxInstalled> {
     use futures::stream::TryStreamExt;
-    use netlink_packet_route::rule::{RuleAction, RuleAttribute};
     use rtnetlink::new_connection;
 
     let (conn, handle, _) = new_connection().context("rtnetlink connect")?;
@@ -268,8 +211,6 @@ async fn install_linux(
     } else {
         DEFAULT_TABLE as u32
     };
-    // Rule priorities: protect (private) < mark→main < unmarked→TUN
-    // Leave room below rule_start for protect rules.
     let rule_start = if cfg.iproute2_rule_index != 0 {
         cfg.iproute2_rule_index as u32
     } else {
@@ -279,39 +220,19 @@ async fn install_linux(
     let mut installed = LinuxInstalled {
         if_index,
         table,
-        output_mark: marks.output,
         routes: Vec::new(),
         rules: Vec::new(),
-        mangle_protect: false,
     };
 
-    // Routes only in dedicated table (never replace main default).
     for (dest, v6) in pfx {
-        if *v6 && !has_v6 {
-            continue;
-        }
-        if !*v6 && !has_v4 {
+        if (*v6 && !has_v6) || (!*v6 && !has_v4) {
             continue;
         }
         match add_route(&handle, if_index, table, dest, *v6).await {
             Ok(()) => installed.routes.push((*v6, dest.clone())),
-            Err(e) => warn!(dest = %dest, err = %e, "rtnetlink route add failed"),
+            Err(e) => warn!(dest = %dest, err = %e, "route add failed"),
         }
     }
-
-    // MUST run before traffic hits TUN policy: replies get output_mark → main.
-    if marks.output != 0 {
-        installed.mangle_protect = install_established_protect(marks.output);
-        if !installed.mangle_protect {
-            warn!(
-                "tun: ESTABLISHED protect missing — remote access (SSH) will likely break with auto-route"
-            );
-        }
-    }
-
-    // Private / link-local → main (high priority, below local=0)
-    let protect_prio = rule_start.saturating_sub(20);
-    add_private_protect_rules(&handle, has_v4, has_v6, protect_prio, cfg, &mut installed).await;
 
     if marks.redirect_mode {
         add_rules_redirect_mark(
@@ -325,15 +246,14 @@ async fn install_linux(
         )
         .await;
     } else {
-        add_rules_classic(
+        add_rules_classic_mihomo(
             &handle,
             if_name,
-            marks,
+            cfg,
             has_v4,
             has_v6,
             table,
             rule_start,
-            cfg.strict_route,
             &mut installed,
         )
         .await;
@@ -344,11 +264,9 @@ async fn install_linux(
         if_index,
         table,
         redirect_mode = marks.redirect_mode,
-        output_mark = format!("0x{:x}", marks.output),
-        mangle_protect = installed.mangle_protect,
         routes = installed.routes.len(),
         rules = installed.rules.len(),
-        "tun: auto-route installed (SSH replies protected via ESTABLISHED mark)"
+        "tun: auto-route installed (sing-tun / mihomo topology)"
     );
     Ok(installed)
 }
@@ -376,7 +294,7 @@ async fn add_route(
             .table_id(table)
             .execute()
             .await
-            .map_err(|e| anyhow::anyhow!("route add {dest}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
         let ip: Ipv4Addr = ip_s.parse()?;
         handle
@@ -388,81 +306,12 @@ async fn add_route(
             .table_id(table)
             .execute()
             .await
-            .map_err(|e| anyhow::anyhow!("route add {dest}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-async fn add_private_protect_rules(
-    handle: &rtnetlink::Handle,
-    has_v4: bool,
-    has_v6: bool,
-    prio: u32,
-    cfg: &TunConfig,
-    inst: &mut LinuxInstalled,
-) {
-    use netlink_packet_route::rule::RuleAction;
-
-    let mut cidrs_v4: Vec<(Ipv4Addr, u8)> = vec![
-        (Ipv4Addr::new(10, 0, 0, 0), 8),
-        (Ipv4Addr::new(172, 16, 0, 0), 12),
-        (Ipv4Addr::new(192, 168, 0, 0), 16),
-        (Ipv4Addr::new(169, 254, 0, 0), 16),
-        (Ipv4Addr::new(127, 0, 0, 0), 8),
-    ];
-    for s in &cfg.route_exclude_address {
-        if let Ok((ip, pl)) = parse_v4_cidr(s) {
-            cidrs_v4.push((ip, pl));
-        }
-    }
-
-    if has_v4 {
-        for (ip, pl) in cidrs_v4 {
-            match handle
-                .rule()
-                .add()
-                .v4()
-                .priority(prio)
-                .destination_prefix(ip, pl)
-                .table_id(254) // main
-                .action(RuleAction::ToTable)
-                .execute()
-                .await
-            {
-                Ok(()) => inst.rules.push((prio, false)),
-                Err(e) => warn!(?ip, pl, err = %e, "protect rule v4 failed"),
-            }
-        }
-    }
-    if has_v6 {
-        // fc00::/7 ULA, fe80::/10 link-local, ::1/128
-        for (ip, pl) in [
-            ("fc00::", 7u8),
-            ("fe80::", 10u8),
-            ("::1", 128u8),
-        ] {
-            let ip: Ipv6Addr = ip.parse().expect("static");
-            match handle
-                .rule()
-                .add()
-                .v6()
-                .priority(prio)
-                .destination_prefix(ip, pl)
-                .table_id(254)
-                .action(RuleAction::ToTable)
-                .execute()
-                .await
-            {
-                Ok(()) => inst.rules.push((prio, true)),
-                Err(e) => warn!(?ip, err = %e, "protect rule v6 failed"),
-            }
-        }
-    }
-}
-
-/// Dual-mark topology when auto-redirect is on (sing-tun AutoRedirectMarkMode).
-/// Unmarked traffic uses main (32766) first — safer for servers.
+/// sing-tun AutoRedirectMarkMode
 #[cfg(any(target_os = "linux", target_os = "android"))]
 async fn add_rules_redirect_mark(
     handle: &rtnetlink::Handle,
@@ -478,80 +327,116 @@ async fn add_rules_redirect_mark(
     let mut prio4 = rule_start;
     let mut prio6 = rule_start;
 
-    // Explicit: output mark → main (proxy dialer, ESTABLISHED replies)
     if has_v4 {
-        let prio = prio4;
-        match handle
-            .rule()
-            .add()
-            .v4()
-            .priority(prio)
-            .fw_mark(marks.output)
-            .table_id(254)
-            .action(RuleAction::ToTable)
-            .execute()
-            .await
+        // output mark → goto +2
         {
-            Ok(()) => inst.rules.push((prio, false)),
-            Err(e) => warn!(err = %e, "redirect-mode output→main v4 failed"),
+            let prio = prio4;
+            let mut req = handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .fw_mark(marks.output)
+                .action(RuleAction::Goto);
+            req.message_mut()
+                .attributes
+                .push(RuleAttribute::Goto(prio + 2));
+            match req.execute().await {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(err = %e, "v4 output goto"),
+            }
         }
         prio4 += 1;
-
-        // input mark → TUN table
-        let prio = prio4;
-        match handle
-            .rule()
-            .add()
-            .v4()
-            .priority(prio)
-            .fw_mark(marks.input)
-            .table_id(table)
-            .action(RuleAction::ToTable)
-            .execute()
-            .await
+        // input mark → TUN
         {
-            Ok(()) => inst.rules.push((prio, false)),
-            Err(e) => warn!(err = %e, "redirect-mode input→tun v4 failed"),
+            let prio = prio4;
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .fw_mark(marks.input)
+                .table_id(table)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(err = %e, "v4 input→tun"),
+            }
         }
         prio4 += 1;
-        let _ = prio4;
+        // empty / nop separator
+        {
+            let prio = prio4;
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio)
+                .action(RuleAction::Unspec)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, false)),
+                Err(e) => warn!(err = %e, "v4 nop"),
+            }
+        }
     }
     if has_v6 {
-        let prio = prio6;
-        match handle
-            .rule()
-            .add()
-            .v6()
-            .priority(prio)
-            .fw_mark(marks.output)
-            .table_id(254)
-            .action(RuleAction::ToTable)
-            .execute()
-            .await
         {
-            Ok(()) => inst.rules.push((prio, true)),
-            Err(e) => warn!(err = %e, "redirect-mode output→main v6 failed"),
+            let prio = prio6;
+            let mut req = handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .fw_mark(marks.output)
+                .action(RuleAction::Goto);
+            req.message_mut()
+                .attributes
+                .push(RuleAttribute::Goto(prio + 2));
+            match req.execute().await {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "v6 output goto"),
+            }
         }
         prio6 += 1;
-        let prio = prio6;
-        match handle
-            .rule()
-            .add()
-            .v6()
-            .priority(prio)
-            .fw_mark(marks.input)
-            .table_id(table)
-            .action(RuleAction::ToTable)
-            .execute()
-            .await
         {
-            Ok(()) => inst.rules.push((prio, true)),
-            Err(e) => warn!(err = %e, "redirect-mode input→tun v6 failed"),
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .fw_mark(marks.input)
+                .table_id(table)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "v6 input→tun"),
+            }
         }
-        let _ = prio6;
+        prio6 += 1;
+        {
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .action(RuleAction::Unspec)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "v6 nop"),
+            }
+        }
     }
 
-    // Fallback after main/default — only if main has no route
     let fb = DEFAULT_FALLBACK_RULE_PRIORITY as u32;
     if has_v4 {
         match handle
@@ -565,7 +450,7 @@ async fn add_rules_redirect_mark(
             .await
         {
             Ok(()) => inst.rules.push((fb, false)),
-            Err(e) => warn!(err = %e, "fallback rule4 failed"),
+            Err(e) => warn!(err = %e, "fallback v4"),
         }
     }
     if has_v6 {
@@ -580,76 +465,146 @@ async fn add_rules_redirect_mark(
             .await
         {
             Ok(()) => inst.rules.push((fb, true)),
-            Err(e) => warn!(err = %e, "fallback rule6 failed"),
+            Err(e) => warn!(err = %e, "fallback v6"),
         }
     }
-
-    // silence unused import warning if Goto not used in this mode
-    let _ = RuleAttribute::Goto(0);
 }
 
-/// Classic auto-route (no auto-redirect): unmarked NEW traffic → TUN table;
-/// marked (proxy + ESTABLISHED replies) → main.
+/// Classic auto-route — full sing-tun / mihomo topology (non-Android).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::too_many_arguments)]
-async fn add_rules_classic(
+async fn add_rules_classic_mihomo(
     handle: &rtnetlink::Handle,
     if_name: &str,
-    marks: TunMarks,
+    cfg: &TunConfig,
     has_v4: bool,
     has_v6: bool,
     table: u32,
     rule_start: u32,
-    strict_route: bool,
     inst: &mut LinuxInstalled,
 ) {
-    use netlink_packet_route::rule::{RuleAction, RuleAttribute};
+    use netlink_packet_route::rule::{
+        RuleAction, RuleAttribute, RuleFlag, RulePortRange,
+    };
 
     let nop = rule_start + 10;
     let mut prio4 = rule_start;
     let mut prio6 = rule_start;
+    let (tun_v4, tun_v6) = tun_address_prefixes(cfg);
 
-    // 1) output mark → main (proxy outbound + ESTABLISHED replies)
-    if marks.output != 0 {
-        if has_v4 {
-            let prio = prio4;
+    // --- strict-route: unreachable for missing family ---
+    if cfg.strict_route {
+        if !has_v4 {
             match handle
                 .rule()
                 .add()
                 .v4()
-                .priority(prio)
-                .fw_mark(marks.output)
-                .table_id(254)
-                .action(RuleAction::ToTable)
+                .priority(prio4)
+                .action(RuleAction::Unreachable)
                 .execute()
                 .await
             {
-                Ok(()) => inst.rules.push((prio, false)),
-                Err(e) => warn!(err = %e, "mark→main v4 failed"),
+                Ok(()) => inst.rules.push((prio4, false)),
+                Err(e) => warn!(err = %e, "strict v4"),
             }
             prio4 += 1;
         }
-        if has_v6 {
-            let prio = prio6;
+        if !has_v6 {
             match handle
                 .rule()
                 .add()
                 .v6()
-                .priority(prio)
-                .fw_mark(marks.output)
-                .table_id(254)
-                .action(RuleAction::ToTable)
+                .priority(prio6)
+                .action(RuleAction::Unreachable)
                 .execute()
                 .await
             {
-                Ok(()) => inst.rules.push((prio, true)),
-                Err(e) => warn!(err = %e, "mark→main v6 failed"),
+                Ok(()) => inst.rules.push((prio6, true)),
+                Err(e) => warn!(err = %e, "strict v6"),
             }
             prio6 += 1;
         }
     }
 
-    // 2) packets arriving from TUN → nop (do not re-apply TUN policy)
+    // --- dst = tun addresses → TUN table ---
+    if has_v4 {
+        for (ip, pl) in &tun_v4 {
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(prio4)
+                .destination_prefix(*ip, *pl)
+                .table_id(table)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio4, false)),
+                Err(e) => warn!(err = %e, "dst tun v4"),
+            }
+        }
+        prio4 += 1;
+    }
+
+    // --- invert dport 53, table main, suppress_prefixlength 0 ---
+    // Non-DNS: try main without default routes; DNS skips this rule.
+    if has_v4 {
+        let prio = prio4;
+        let mut req = handle
+            .rule()
+            .add()
+            .v4()
+            .priority(prio)
+            .table_id(254)
+            .action(RuleAction::ToTable);
+        {
+            let msg = req.message_mut();
+            msg.header.flags.push(RuleFlag::Invert);
+            msg.attributes.push(RuleAttribute::DestinationPortRange(
+                RulePortRange {
+                    start: 53,
+                    end: 53,
+                },
+            ));
+            msg.attributes
+                .push(RuleAttribute::SuppressPrefixLen(0));
+        }
+        match req.execute().await {
+            Ok(()) => inst.rules.push((prio, false)),
+            Err(e) => warn!(err = %e, "suppress dns v4"),
+        }
+        prio4 += 1;
+    }
+    if has_v6 {
+        let prio = prio6;
+        let mut req = handle
+            .rule()
+            .add()
+            .v6()
+            .priority(prio)
+            .table_id(254)
+            .action(RuleAction::ToTable);
+        {
+            let msg = req.message_mut();
+            msg.header.flags.push(RuleFlag::Invert);
+            msg.attributes.push(RuleAttribute::DestinationPortRange(
+                RulePortRange {
+                    start: 53,
+                    end: 53,
+                },
+            ));
+            msg.attributes
+                .push(RuleAttribute::SuppressPrefixLen(0));
+        }
+        match req.execute().await {
+            Ok(()) => inst.rules.push((prio, true)),
+            Err(e) => warn!(err = %e, "suppress dns v6"),
+        }
+        prio6 += 1;
+    }
+
+    // --- iif TUN → goto nop ---
     if has_v4 {
         let prio = prio4;
         let mut req = handle
@@ -664,7 +619,7 @@ async fn add_rules_classic(
             .push(RuleAttribute::Goto(nop));
         match req.execute().await {
             Ok(()) => inst.rules.push((prio, false)),
-            Err(e) => warn!(err = %e, "iif tun goto failed"),
+            Err(e) => warn!(err = %e, "iif tun v4"),
         }
         prio4 += 1;
     }
@@ -682,12 +637,53 @@ async fn add_rules_classic(
             .push(RuleAttribute::Goto(nop));
         match req.execute().await {
             Ok(()) => inst.rules.push((prio, true)),
-            Err(e) => warn!(err = %e, "iif tun goto6 failed"),
+            Err(e) => warn!(err = %e, "iif tun v6"),
         }
         prio6 += 1;
     }
 
-    // 3) unmarked → TUN table (client outbound). Replies are marked in step 0 (mangle).
+    // --- not iif lo → TUN table  (FORWARDED only; local SSH replies are iif=lo) ---
+    if has_v4 {
+        let prio = prio4;
+        let mut req = handle
+            .rule()
+            .add()
+            .v4()
+            .priority(prio)
+            .input_interface("lo".into())
+            .table_id(table)
+            .action(RuleAction::ToTable);
+        req.message_mut()
+            .header
+            .flags
+            .push(RuleFlag::Invert);
+        match req.execute().await {
+            Ok(()) => inst.rules.push((prio, false)),
+            Err(e) => warn!(err = %e, "not iif lo v4"),
+        }
+        // same priority for lo-src rules below (sing-tun shares priority)
+    }
+    if has_v6 {
+        let prio = prio6;
+        let mut req = handle
+            .rule()
+            .add()
+            .v6()
+            .priority(prio)
+            .input_interface("lo".into())
+            .table_id(table)
+            .action(RuleAction::ToTable);
+        req.message_mut()
+            .header
+            .flags
+            .push(RuleFlag::Invert);
+        match req.execute().await {
+            Ok(()) => inst.rules.push((prio, true)),
+            Err(e) => warn!(err = %e, "not iif lo v6"),
+        }
+    }
+
+    // --- iif lo from 0.0.0.0/32 → TUN ---
     if has_v4 {
         let prio = prio4;
         match handle
@@ -695,71 +691,121 @@ async fn add_rules_classic(
             .add()
             .v4()
             .priority(prio)
+            .input_interface("lo".into())
+            .source_prefix(Ipv4Addr::UNSPECIFIED, 32)
             .table_id(table)
             .action(RuleAction::ToTable)
             .execute()
             .await
         {
             Ok(()) => inst.rules.push((prio, false)),
-            Err(e) => warn!(err = %e, "unmarked→tun v4 failed"),
+            Err(e) => warn!(err = %e, "lo from 0.0.0.0/32"),
         }
-        prio4 += 1;
-    }
-    if has_v6 {
-        let prio = prio6;
-        match handle
-            .rule()
-            .add()
-            .v6()
-            .priority(prio)
-            .table_id(table)
-            .action(RuleAction::ToTable)
-            .execute()
-            .await
-        {
-            Ok(()) => inst.rules.push((prio, true)),
-            Err(e) => warn!(err = %e, "unmarked→tun v6 failed"),
-        }
-        prio6 += 1;
-    }
-
-    if strict_route {
-        // Unreachable for disabled family only — do NOT pin 0.0.0.0/1 on main
-        // (that is what made the whole host unreachable before).
-        if !has_v4 {
-            let prio = prio4;
+        // --- iif lo from tun addresses → TUN ---
+        for (ip, pl) in &tun_v4 {
             match handle
                 .rule()
                 .add()
                 .v4()
                 .priority(prio)
-                .action(RuleAction::Unreachable)
+                .input_interface("lo".into())
+                .source_prefix(*ip, *pl)
+                .table_id(table)
+                .action(RuleAction::ToTable)
                 .execute()
                 .await
             {
                 Ok(()) => inst.rules.push((prio, false)),
-                Err(e) => warn!(err = %e, "strict unreachable v4 failed"),
+                Err(e) => warn!(err = %e, "lo from tun v4"),
             }
         }
-        if !has_v6 {
+        prio4 += 1;
+    }
+
+    if has_v6 {
+        // iif lo from ::/1 and 8000::/1 → goto nop (sing-tun)
+        for (ip, pl) in [
+            (Ipv6Addr::UNSPECIFIED, 1u8),
+            (Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0), 1u8),
+        ] {
+            let prio = prio6;
+            let mut req = handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .input_interface("lo".into())
+                .source_prefix(ip, pl)
+                .action(RuleAction::Goto);
+            req.message_mut()
+                .attributes
+                .push(RuleAttribute::Goto(nop));
+            match req.execute().await {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "lo from v6 half"),
+            }
+        }
+        prio6 += 1;
+        for (ip, pl) in &tun_v6 {
             let prio = prio6;
             match handle
                 .rule()
                 .add()
                 .v6()
                 .priority(prio)
-                .action(RuleAction::Unreachable)
+                .input_interface("lo".into())
+                .source_prefix(*ip, *pl)
+                .table_id(table)
+                .action(RuleAction::ToTable)
                 .execute()
                 .await
             {
                 Ok(()) => inst.rules.push((prio, true)),
-                Err(e) => warn!(err = %e, "strict unreachable v6 failed"),
+                Err(e) => warn!(err = %e, "lo from tun v6"),
             }
         }
-        info!("tun: strict-route (unreachable only, no main-table pin)");
+        prio6 += 1;
+        // v6 catch-all → TUN (sing-tun has this for v6 only)
+        {
+            let prio = prio6;
+            match handle
+                .rule()
+                .add()
+                .v6()
+                .priority(prio)
+                .table_id(table)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((prio, true)),
+                Err(e) => warn!(err = %e, "v6 catch-all"),
+            }
+        }
     }
 
-    // nop anchors
+    // --- user route-exclude → main (higher priority than rule_start) ---
+    let ex_prio = rule_start.saturating_sub(5);
+    for s in &cfg.route_exclude_address {
+        if let Ok((ip, pl)) = parse_v4_cidr(s) {
+            match handle
+                .rule()
+                .add()
+                .v4()
+                .priority(ex_prio)
+                .destination_prefix(ip, pl)
+                .table_id(254)
+                .action(RuleAction::ToTable)
+                .execute()
+                .await
+            {
+                Ok(()) => inst.rules.push((ex_prio, false)),
+                Err(e) => warn!(err = %e, "exclude"),
+            }
+        }
+    }
+
+    // --- nop anchors ---
     if has_v4 {
         match handle
             .rule()
@@ -771,7 +817,7 @@ async fn add_rules_classic(
             .await
         {
             Ok(()) => inst.rules.push((nop, false)),
-            Err(e) => warn!(err = %e, "nop4 failed"),
+            Err(e) => warn!(err = %e, "nop4"),
         }
     }
     if has_v6 {
@@ -785,16 +831,17 @@ async fn add_rules_classic(
             .await
         {
             Ok(()) => inst.rules.push((nop, true)),
-            Err(e) => warn!(err = %e, "nop6 failed"),
+            Err(e) => warn!(err = %e, "nop6"),
         }
     }
+
+    let _ = prio4;
+    let _ = prio6;
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn parse_v4_cidr(s: &str) -> Result<(Ipv4Addr, u8)> {
-    let (ip, pl) = s
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("cidr"))?;
+    let (ip, pl) = s.split_once('/').ok_or_else(|| anyhow::anyhow!("cidr"))?;
     Ok((ip.parse()?, pl.parse()?))
 }
 
