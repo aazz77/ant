@@ -18,6 +18,7 @@ pub struct RouteGuard {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 struct LinuxInstalled {
+    #[allow(dead_code)]
     if_index: u32,
     table: u32,
     routes: Vec<(bool, String)>, // v6, dest CIDR
@@ -110,6 +111,7 @@ fn prefixes(cfg: &TunConfig) -> Result<Vec<(String, bool)>> {
     Ok(out)
 }
 
+#[allow(clippy::needless_return)]
 pub async fn install_routes(
     if_name: &str,
     cfg: &TunConfig,
@@ -153,7 +155,6 @@ async fn install_linux(
     pfx: &[(String, bool)],
 ) -> Result<LinuxInstalled> {
     use futures::stream::TryStreamExt;
-    use netlink_packet_route::rule::{RuleAction, RuleAttribute};
     use rtnetlink::new_connection;
 
     let (conn, handle, _) = new_connection().context("rtnetlink connect")?;
@@ -438,6 +439,7 @@ async fn add_rules_redirect_mark(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::too_many_arguments)]
 async fn add_rules_classic(
     handle: &rtnetlink::Handle,
     if_name: &str,

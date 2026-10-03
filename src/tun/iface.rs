@@ -55,24 +55,24 @@ pub fn start_monitor(exclude: String, enable: bool) {
         let ex2 = exclude;
         tokio::task::spawn_blocking(move || {
             // Blocks; each line triggers refresh.
-            let _ = Command::new("ip")
+            let child = Command::new("ip")
                 .args(["-o", "monitor", "route", "link"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .spawn()
-                .and_then(|mut child| {
-                    use std::io::{BufRead, BufReader};
-                    if let Some(out) = child.stdout.take() {
-                        let reader = BufReader::new(out);
-                        for line in reader.lines().flatten() {
-                            if line.contains("default") || line.contains("link") {
-                                refresh(&ex2);
-                            }
-                        }
+                .spawn();
+            let Ok(mut child) = child else {
+                return;
+            };
+            use std::io::{BufRead, BufReader};
+            if let Some(out) = child.stdout.take() {
+                let reader = BufReader::new(out);
+                for line in reader.lines().map_while(Result::ok) {
+                    if line.contains("default") || line.contains("link") {
+                        refresh(&ex2);
                     }
-                    let _ = child.wait();
-                    Ok(())
-                });
+                }
+            }
+            let _ = child.wait();
         });
     }
 }
