@@ -6,7 +6,8 @@ mod mixed;
 // Windows builds exclude them entirely.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod redir;
-mod target;
+// Public so top-level `tun` can resolve destinations via `crate::inbound::target`.
+pub mod target;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod tproxy;
 
@@ -15,4 +16,3 @@ pub use mixed::run_mixed;
 pub use redir::run_redir;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use tproxy::run_tproxy;
-
