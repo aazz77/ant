@@ -6,7 +6,7 @@ Inspired by [clash-rs](https://github.com/Watfaq/clash-rs) (protocol code patter
 
 ## Features (v0.1)
 
-- **Inbound**: `mixed-port` (HTTP CONNECT + SOCKS5 TCP/UDP), `tproxy-port` (Linux TProxy TCP+UDP), `redir-port`
+- **Inbound**: `mixed-port` (HTTP CONNECT + SOCKS5 TCP/UDP), `tproxy-port` (Linux TProxy TCP+UDP), `redir-port`, TUN (system stack)
 - **Outbound**: Hysteria2 / VLESS (ws / xhttp / REALITY) + direct / block
 - **DNS**: local UDP/TCP DNS; domain rules that route to direct use `direct-nameserver`, others use `proxy-nameserver`
 - **Routing**: sequential `RULE-SET` match; TLS/HTTP sniff first; required `MATCH` last
@@ -62,9 +62,26 @@ Sniff runs on every connection before ruleset matching (TLS SNI / HTTP Host).
 # point iptables/nft TPROXY rules at that port for TCP and UDP
 ```
 
+## TUN
+
+System stack only. Optional OS integration (mihomo-style):
+
+```yaml
+tun:
+  enable: true
+  address: ["198.18.0.1/30"]
+  dns-hijack: ["any:53"]
+  auto-route: true
+  auto-detect-interface: true
+  auto-redirect: false   # Linux only; requires redir-port
+  strict-route: false
+```
+
+Set `mark:` (e.g. 255) together with auto-route so proxy outbound stays on the main table.
+
 ## Limitations
 
-- Windows: `mixed-port` only (transparent inbounds are Linux/Android-specific and excluded at compile time)
+- Windows: no tproxy/redir; TUN auto-route/dns-hijack supported; auto-redirect is Linux-only
 - DNS upstream schemes: udp / tcp / tls / https
 - No connection stats / hot reload
 - Rules: only `RULE-SET` and `MATCH` (no DOMAIN-SUFFIX etc. yet)

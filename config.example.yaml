@@ -12,7 +12,7 @@ redir-port: 7892
 #              # DNS-query sniffing follows dns.route-hijack independently
 
 # TUN virtual NIC (system stack only). Does NOT install routes — you must
-# point traffic at the device yourself (ip rule/route, or Windows routes).
+# use auto-route (or point traffic at the device yourself with ip rule/route).
 # Linux: CAP_NET_ADMIN. Windows: place wintun.dll next to the binary
 # (https://www.wintun.net/).
 # tun:
@@ -22,11 +22,21 @@ redir-port: 7892
 #     - 198.18.0.1/30     # need room for addr+1 (client); avoid /32
 #     # - fd00::1/126
 #   mtu: 1500
+#   dns-hijack:           # intercept DNS inside TUN stack → local dns module
+#     - any:53
+#   auto-route: true      # install split-default routes into TUN
+#   auto-detect-interface: true  # bind outbound to physical default NIC (anti-loop)
+#   auto-redirect: false  # Linux only; needs redir-port > 0
+#   strict-route: false   # stronger anti-leak on top of auto-route
+#   # route-address:      # custom prefixes instead of 0.0.0.0/1 + 128.0.0.0/1
+#   #   - 0.0.0.0/1
+#   #   - 128.0.0.0/1
+#   # route-exclude-address: []
+#   # iproute2-table-index: 1982
+#   # iproute2-rule-index: 9000
 #
-# Example Linux (manual route, mark=255 to avoid loops with mark: 255):
-#   ip rule add fwmark 255 lookup main prefer
-#   ip route add default dev tun0 table 2022
-#   ip rule add not fwmark 255 table 2022
+# With auto-route + mark: 255, policy routing keeps proxy traffic on main table.
+# redir-port: 7892        # required if auto-redirect: true
 
 dns:
   # route-hijack: true  # steal port 53 and sniffed DNS into this module
