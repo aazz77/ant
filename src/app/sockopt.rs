@@ -45,7 +45,7 @@ fn apply_bind_iface(sock: &Socket) {
     // packets do not re-enter TUN when auto-route is on.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        if let Some(name) = crate::tun::iface::bind_interface() {
+        if let Some(name) = crate::tun::bind_interface() {
             // socket2 0.5: bind_device takes Option<&[u8]>
             if let Err(e) = sock.bind_device(Some(name.as_bytes())) {
                 tracing::warn!("SO_BINDTODEVICE {name}: {e}");
