@@ -26,7 +26,7 @@ redir-port: 7892
 #     - any:53
 #   auto-route: true      # install split-default routes into TUN
 #   auto-detect-interface: true  # bind outbound to physical default NIC (anti-loop)
-#   auto-redirect: false  # Linux only; needs redir-port > 0
+#   auto-redirect: false  # Linux only; internal listener, no redir-port needed
 #   strict-route: false   # stronger anti-leak on top of auto-route
 #   # route-address:      # custom prefixes instead of 0.0.0.0/1 + 128.0.0.0/1
 #   #   - 0.0.0.0/1
@@ -35,8 +35,8 @@ redir-port: 7892
 #   # iproute2-table-index: 1982
 #   # iproute2-rule-index: 9000
 #
-# With auto-route + mark: 255, policy routing keeps proxy traffic on main table.
-# redir-port: 7892        # required if auto-redirect: true
+# mark omitted → auto 255 when auto-route/redirect/detect-interface is on.
+# auto-redirect does not need redir-port (internal accept path).
 
 dns:
   # route-hijack: true  # steal port 53 and sniffed DNS into this module
