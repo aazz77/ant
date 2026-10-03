@@ -11,6 +11,9 @@ pub struct Config {
     #[serde(flatten)]
     pub global: GlobalConfig,
     pub dns: DnsConfig,
+    /// TUN virtual NIC (optional). System stack only; no auto_route.
+    #[serde(default)]
+    pub tun: TunConfig,
     /// Proxy nodes: list under `proxies:`; each node has a unique `name`.
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
@@ -20,6 +23,41 @@ pub struct Config {
     /// mihomo-style rule strings: `RULE-SET,name,outbound` / `MATCH,outbound`.
     #[serde(default)]
     pub rules: Vec<String>,
+}
+
+
+/// Flat `tun:` block. Creates a virtual NIC and runs the system stack.
+/// Does **not** install routes — the user must route traffic into the device.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TunConfig {
+    /// Master switch. Default false.
+    #[serde(default)]
+    pub enable: bool,
+    /// Interface name. Empty → OS assigns (Linux `tunN`; Windows defaults to `ant-tun`).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Address prefixes, e.g. `["198.18.0.1/30"]`.
+    /// System stack needs server=addr, client=addr+1 inside the prefix — avoid `/32`.
+    #[serde(default)]
+    pub address: Vec<String>,
+    /// MTU. Default 1500.
+    #[serde(default = "default_tun_mtu")]
+    pub mtu: u32,
+}
+
+impl Default for TunConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            device: None,
+            address: Vec::new(),
+            mtu: default_tun_mtu(),
+        }
+    }
+}
+
+fn default_tun_mtu() -> u32 {
+    1500
 }
 
 #[derive(Debug, Clone, Deserialize)]

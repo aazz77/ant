@@ -8,6 +8,8 @@ mod app;
 mod config;
 mod dns;
 mod inbound;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+mod tun;
 mod outbound;
 mod ruleset;
 
@@ -145,6 +147,19 @@ async fn main() -> Result<()> {
         }));
     }
 
+    // TUN: Linux / Android / Windows. No auto_route — user routes traffic in.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+    if cfg.tun.enable {
+        let r = router.clone();
+        let o = outbounds.clone();
+        let tun_cfg = cfg.tun.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = tun::run_tun(tun_cfg, r, o).await {
+                tracing::error!("tun inbound exited: {e:#}");
+            }
+        }));
+    }
+
     if !cfg.global.api.trim().is_empty() {
         match app::api::parse_listen(&cfg.global.api) {
             Ok(addr) => {
@@ -169,7 +184,9 @@ async fn main() -> Result<()> {
     }
 
     if handles.is_empty() {
-        anyhow::bail!("no inbound enabled (set mixed-port / tproxy-port / redir-port / port)");
+        anyhow::bail!(
+            "no inbound enabled (set mixed-port / tproxy-port / redir-port / tun.enable / port)"
+        );
     }
 
     tracing::info!("ant ready");
@@ -194,9 +211,10 @@ async fn cmd_check(path: &str) -> Result<()> {
         cfg.global.mixed_port > 0
             || cfg.global.tproxy_port > 0
             || cfg.global.redir_port > 0
+            || cfg.tun.enable
             || !cfg.global.api.trim().is_empty()
             || cfg.dns.port > 0,
-        "no inbound enabled (set mixed-port / tproxy-port / redir-port / port)"
+        "no inbound enabled (set mixed-port / tproxy-port / redir-port / tun.enable / port)"
     );
 
     crate::dns::set_bootstrap(
