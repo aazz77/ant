@@ -50,9 +50,10 @@ impl OutboundManager {
     pub async fn new(proxies: &[ProxyConfig], dns: Option<&DnsConfig>) -> Result<Arc<Self>> {
         // ECH 的 DNS HTTPS RR 查询 upstream 优先级：
         // proxy-nameserver（通常为加密上游）→ default-nameserver（bootstrap）。
+        // 这里只做 parse（无网络 IO）；域名上游的解析在 exchange 时惰性完成。
         let ech_dns: Vec<DnsUpstream> = match dns {
             Some(d) => [
-                d.resolved_proxy.clone(),
+                parse_nameserver(&d.proxy_nameserver).ok(),
                 parse_nameserver(&d.default_nameserver).ok(),
             ]
             .into_iter()

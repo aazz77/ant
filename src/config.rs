@@ -89,10 +89,6 @@ pub struct DnsConfig {
     pub ipv6: bool,
     #[serde(default = "default_cache_size", rename = "cache-size")]
     pub cache_size: usize,
-    #[serde(skip)]
-    pub resolved_direct: Option<crate::dns::DnsUpstream>,
-    #[serde(skip)]
-    pub resolved_proxy: Option<crate::dns::DnsUpstream>,
 }
 
 fn default_dns_mode() -> String {
@@ -485,6 +481,20 @@ impl Config {
         crate::dns::parse_nameserver(&self.dns.direct_nameserver).context("invalid direct-nameserver")?;
         crate::dns::parse_nameserver(&self.dns.proxy_nameserver).context("invalid proxy-nameserver")?;
         crate::dns::parse_nameserver(&self.dns.default_nameserver).context("invalid default-nameserver")?;
+        // default-nameserver 是 bootstrap 本身，不能依赖任何解析：必须是纯 IP。
+        {
+            let raw = self.dns.default_nameserver.trim();
+            let host_part = raw.rsplit("://").next().unwrap_or(raw);
+            let host_part = host_part.split('/').next().unwrap_or(host_part);
+            let host = if let Some(end) = host_part.find(']') {
+                &host_part[1..end]
+            } else {
+                host_part.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_part)
+            };
+            if host.parse::<std::net::IpAddr>().is_err() {
+                bail!("default-nameserver must be a pure IP address (got {host})");
+            }
+        }
 
         // rule-providers
         let rulesets = self.ruleset_list()?;

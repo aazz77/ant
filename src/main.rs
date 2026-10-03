@@ -79,8 +79,15 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    let mut cfg = Config::load(&cli.config)?;
-    crate::dns::apply_bootstrap(&mut cfg).await?;
+    let cfg = Config::load(&cli.config)?;
+    // 注册 bootstrap 上游（default-nameserver，纯 IP）。这里只做内存注册，
+    // 不发起任何网络请求：所有域名解析都推迟到实际使用点（DNS 查询 / 拨号），
+    // 失败仅影响当次操作并自然重试，绝不阻塞或终止启动。
+    crate::dns::set_bootstrap(
+        crate::dns::parse_nameserver(&cfg.dns.default_nameserver)
+            .context("invalid default-nameserver")?,
+    );
+    tracing::info!("default-nameserver {}", cfg.dns.default_nameserver);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&cfg.global.log_level));
     tracing_subscriber::fmt()
@@ -176,7 +183,7 @@ async fn main() -> Result<()> {
 async fn cmd_check(path: &str) -> Result<()> {
     println!("checking config: {path}");
 
-    let mut cfg = Config::load(path).context("config invalid")?;
+    let cfg = Config::load(path).context("config invalid")?;
     println!(
         "  ok    YAML parse + validate ({} proxy node(s), {} rule(s))",
         cfg.proxies.len(),
@@ -192,12 +199,13 @@ async fn cmd_check(path: &str) -> Result<()> {
         "no inbound enabled (set mixed-port / tproxy-port / redir-port / port)"
     );
 
-    crate::dns::apply_bootstrap(&mut cfg)
-        .await
-        .context("bootstrap DNS via default-nameserver failed")?;
+    crate::dns::set_bootstrap(
+        crate::dns::parse_nameserver(&cfg.dns.default_nameserver)
+            .context("invalid default-nameserver")?,
+    );
     println!(
-        "  ok    bootstrap dns: direct={} proxy={}",
-        cfg.dns.direct_nameserver, cfg.dns.proxy_nameserver
+        "  ok    bootstrap dns: default={} direct={} proxy={}",
+        cfg.dns.default_nameserver, cfg.dns.direct_nameserver, cfg.dns.proxy_nameserver
     );
 
     Router::from_config(&cfg).context("router build failed")?;

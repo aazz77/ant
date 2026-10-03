@@ -6,7 +6,9 @@ mod upstream;
 pub mod fakeip;
 pub mod cache;
 
-pub use upstream::{apply_bootstrap, exchange, parse_nameserver, DnsUpstream};
+pub use upstream::{
+    exchange, parse_nameserver, resolve_host_via_bootstrap, set_bootstrap, DnsUpstream,
+};
 
 use crate::config::Config;
 use crate::app::router::{Outbound, Router};
@@ -20,10 +22,10 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 pub async fn run_dns_server(cfg: Arc<Config>, router: Arc<Router>) -> Result<()> {
     let port = cfg.dns.port;
     let direct_up = Arc::new(
-        cfg.dns.resolved_direct.clone().unwrap_or(parse_nameserver(&cfg.dns.direct_nameserver).context("parse direct-nameserver")?),
+        parse_nameserver(&cfg.dns.direct_nameserver).context("parse direct-nameserver")?,
     );
     let proxy_up = Arc::new(
-        cfg.dns.resolved_proxy.clone().unwrap_or(parse_nameserver(&cfg.dns.proxy_nameserver).context("parse proxy-nameserver")?),
+        parse_nameserver(&cfg.dns.proxy_nameserver).context("parse proxy-nameserver")?,
     );
     tracing::info!("DNS upstream direct={direct_up} proxy={proxy_up} ipv6={}", cfg.dns.ipv6);
 

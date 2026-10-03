@@ -554,12 +554,9 @@ async fn resolve_server(host: &str, port: u16) -> Result<SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    let mut addrs = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("resolve {host}"))?;
-    addrs
-        .next()
-        .ok_or_else(|| anyhow!("no address for {host}"))
+    // 域名：default-nameserver（bootstrap）优先，系统解析回落，
+    // 避免系统 DNS 指回 ant 自身时的解析回环；失败仅影响当次拨号。
+    crate::dns::resolve_host_via_bootstrap(host, port).await
 }
 
 fn parse_addr_str(s: &str) -> Option<SocketAddr> {

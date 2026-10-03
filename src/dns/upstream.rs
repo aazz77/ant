@@ -2,8 +2,10 @@
 //! Clash-rs style URL: no scheme → UDP; udp:// tcp:// tls:// https://
 
 use anyhow::{bail, Context, Result};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -16,7 +18,10 @@ pub enum DnsUpstream {
     Udp(SocketAddr),
     Tcp(SocketAddr),
     Dot {
-        addr: SocketAddr,
+        host: String,
+        port: u16,
+        /// 已知地址（纯 IP 配置时直接给出；域名配置时为 None，exchange 时惰性解析）。
+        addr: Option<SocketAddr>,
         sni: String,
     },
     Doh {
@@ -33,7 +38,10 @@ impl std::fmt::Display for DnsUpstream {
         match self {
             Self::Udp(a) => write!(f, "udp://{a}"),
             Self::Tcp(a) => write!(f, "tcp://{a}"),
-            Self::Dot { addr, sni } => write!(f, "tls://{addr} (sni={sni})"),
+            Self::Dot { host, port, addr, sni } => match addr {
+                Some(a) => write!(f, "tls://{a} (sni={sni})"),
+                None => write!(f, "tls://{host}:{port} (sni={sni})"),
+            },
             Self::Doh {
                 host,
                 port,
@@ -79,9 +87,10 @@ pub fn parse_nameserver(s: &str) -> Result<DnsUpstream> {
         }
         "tls" => {
             let (host, port) = split_host_port(rest, 853)?;
-            let addr = resolve_host_port(&host, port)?;
             let sni = host.trim_matches(|c| c == '[' || c == ']').to_string();
-            Ok(DnsUpstream::Dot { addr, sni })
+            // 域名不在此处解析：留给 exchange 时经 default-nameserver 惰性解析。
+            let addr = sni.parse::<std::net::IpAddr>().ok().map(|ip| SocketAddr::new(ip, port));
+            Ok(DnsUpstream::Dot { host: sni.clone(), port, addr, sni })
         }
         "https" => {
             let (authority, path) = match rest.split_once('/') {
@@ -156,15 +165,102 @@ pub async fn exchange(upstream: &DnsUpstream, query: &[u8]) -> Result<Vec<u8>> {
     match upstream {
         DnsUpstream::Udp(addr) => exchange_udp(*addr, query).await,
         DnsUpstream::Tcp(addr) => exchange_tcp(*addr, query).await,
-        DnsUpstream::Dot { addr, sni } => exchange_dot(*addr, sni, query).await,
+        DnsUpstream::Dot { host, port, addr, sni } => {
+            let a = match addr {
+                Some(a) => *a,
+                None => resolve_upstream_addr(host, *port).await?,
+            };
+            match exchange_dot(a, sni, query).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    // 地址可能已变：清缓存，下次查询重新解析。
+                    invalidate_upstream_addr(host, *port);
+                    Err(e)
+                }
+            }
+        }
         DnsUpstream::Doh {
             host,
             port,
             path,
             sni,
             addr,
-        } => exchange_doh(host, *port, path, sni, *addr, query).await,
+        } => {
+            let a = match addr {
+                Some(a) => *a,
+                None => resolve_upstream_addr(host, *port).await?,
+            };
+            match exchange_doh(host, *port, path, sni, Some(a), query).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    invalidate_upstream_addr(host, *port);
+                    Err(e)
+                }
+            }
+        }
     }
+}
+
+// ── 惰性地址解析（对齐 mihomo：启动零网络 IO，用到处才解析，失败不致命）──────
+
+/// bootstrap 上游（`default-nameserver`），main 启动时 set（纯内存，不联网）。
+static BOOTSTRAP: OnceLock<DnsUpstream> = OnceLock::new();
+
+pub fn set_bootstrap(up: DnsUpstream) {
+    let _ = BOOTSTRAP.set(up);
+}
+
+/// DoT/DoH 域名 → 地址的解析缓存。交换失败时由 `exchange` 清除以触发重解。
+static RESOLVED_CACHE: Lazy<Mutex<HashMap<String, SocketAddr>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+async fn resolve_upstream_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let key = format!("{host}:{port}");
+    if let Some(a) = RESOLVED_CACHE.lock().unwrap().get(&key) {
+        return Ok(*a);
+    }
+    let addr = resolve_host_via_bootstrap(host, port)
+        .await
+        .with_context(|| format!("resolve dns upstream host {host}"))?;
+    RESOLVED_CACHE
+        .lock()
+        .unwrap()
+        .insert(key, addr);
+    Ok(addr)
+}
+
+fn invalidate_upstream_addr(host: &str, port: u16) {
+    RESOLVED_CACHE
+        .lock()
+        .unwrap()
+        .remove(&format!("{host}:{port}"));
+}
+
+/// 解析任意主机名：IP 直过 → default-nameserver（bootstrap）优先 → 系统解析回落。
+///
+/// 供 outbound 节点 `server` 域名拨号时使用。bootstrap 优先可避免系统 DNS
+/// 指回 ant 自身时的解析回环；bootstrap 失败仅影响当次解析，由调用方决定
+/// 是否降级，绝不杀进程。
+pub async fn resolve_host_via_bootstrap(host: &str, port: u16) -> Result<SocketAddr> {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    if let Some(boot) = BOOTSTRAP.get() {
+        match lookup_via(boot, host, port).await {
+            Ok(a) => return Ok(a),
+            Err(e) => {
+                tracing::warn!(
+                    "resolve {host} via default-nameserver failed: {e:#}; falling back to system resolver"
+                );
+            }
+        }
+    }
+    let mut it = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve {host} via system resolver"))?;
+    it.next()
+        .with_context(|| format!("no address for {host}"))
 }
 
 async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
@@ -332,14 +428,21 @@ fn tls_connector_doh() -> TlsConnector {
 }
 
 /// Resolve `host` to an address using the bootstrap nameserver (A query).
-/// IP literals are returned as-is. Used for nameserver hostnames and the outbound server.
-pub async fn lookup_via(bootstrap: &DnsUpstream, host: &str, port: u16) -> Result<SocketAddr> {
+/// IP literals are returned as-is.
+async fn lookup_via(bootstrap: &DnsUpstream, host: &str, port: u16) -> Result<SocketAddr> {
     let host = host.trim_matches(|c| c == '[' || c == ']');
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
     let query = build_a_query(host);
-    let resp = exchange(bootstrap, &query).await.context("default-nameserver lookup")?;
+    // bootstrap 只可能是 Udp/Tcp（config validate 强制纯 IP）。这里直接走
+    // 非惰性交换路径，避免 exchange → resolve → lookup_via 的 async 递归。
+    let resp = match bootstrap {
+        DnsUpstream::Udp(a) => exchange_udp(*a, &query).await,
+        DnsUpstream::Tcp(a) => exchange_tcp(*a, &query).await,
+        _ => bail!("default-nameserver must be a pure-IP udp/tcp upstream"),
+    }
+    .context("default-nameserver lookup")?;
     let ip = first_a(&resp).with_context(|| format!("no A record for {host} via default-nameserver"))?;
     Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
 }
@@ -400,60 +503,3 @@ fn skip_name(msg: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// Fill in a numeric address for a nameserver URL using the bootstrap resolver.
-pub async fn resolve_nameserver(spec: &str, bootstrap: &DnsUpstream) -> Result<DnsUpstream> {
-    let up = parse_nameserver(spec)?;
-    match up {
-        DnsUpstream::Udp(addr) if addr.ip().is_unspecified() => Ok(DnsUpstream::Udp(addr)),
-        DnsUpstream::Udp(addr) => {
-            if !addr.ip().is_unspecified() {
-                // already numeric (parse_nameserver requires SocketAddr for udp/tcp)
-                return Ok(DnsUpstream::Udp(addr));
-            }
-            Ok(DnsUpstream::Udp(addr))
-        }
-        DnsUpstream::Tcp(addr) => Ok(DnsUpstream::Tcp(addr)),
-        DnsUpstream::Dot { addr, sni } => {
-            if sni.parse::<std::net::IpAddr>().is_ok() {
-                return Ok(DnsUpstream::Dot { addr, sni });
-            }
-            let resolved = lookup_via(bootstrap, &sni, addr.port()).await?;
-            Ok(DnsUpstream::Dot { addr: resolved, sni })
-        }
-        DnsUpstream::Doh { host, port, path, sni, addr } => {
-            if addr.is_some() {
-                return Ok(DnsUpstream::Doh { host, port, path, sni, addr });
-            }
-            let resolved = lookup_via(bootstrap, &host, port).await?;
-            Ok(DnsUpstream::Doh { host, port, path, sni, addr: Some(resolved) })
-        }
-    }
-}
-
-/// Resolve nameserver and outbound-server hostnames via `default-nameserver`.
-pub async fn apply_bootstrap(cfg: &mut crate::config::Config) -> Result<()> {
-    let boot = parse_nameserver(&cfg.dns.default_nameserver).context("default-nameserver")?;
-    tracing::info!("default-nameserver {boot}");
-    let direct = resolve_nameserver(&cfg.dns.direct_nameserver, &boot).await?;
-    let proxy = resolve_nameserver(&cfg.dns.proxy_nameserver, &boot).await?;
-    tracing::info!("direct-nameserver {direct}");
-    tracing::info!("proxy-nameserver {proxy}");
-    cfg.dns.resolved_direct = Some(direct);
-    cfg.dns.resolved_proxy = Some(proxy);
-    for node in cfg.proxies.iter_mut() {
-        let server = node.server.clone();
-        if server.parse::<std::net::IpAddr>().is_err() {
-            let addr = lookup_via(&boot, &server, node.port).await?;
-            tracing::info!(
-                "node `{}` server {server} -> {} via default-nameserver",
-                node.name,
-                addr.ip()
-            );
-            if node.sni.is_none() {
-                node.sni = Some(server);
-            }
-            node.server = addr.ip().to_string();
-        }
-    }
-    Ok(())
-}

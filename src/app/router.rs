@@ -159,8 +159,8 @@ impl Router {
             fakeip_whitelist: cfg.dns.fakeip_filter_mode == "whitelist",
             sniff: cfg.global.sniff,
             hijack_dns: cfg.dns.route_hijack,
-            direct_dns: cfg.dns.resolved_direct.clone().unwrap_or(parse_nameserver(&cfg.dns.direct_nameserver)?),
-            proxy_dns: cfg.dns.resolved_proxy.clone().unwrap_or(parse_nameserver(&cfg.dns.proxy_nameserver)?),
+            direct_dns: parse_nameserver(&cfg.dns.direct_nameserver)?,
+            proxy_dns: parse_nameserver(&cfg.dns.proxy_nameserver)?,
             ipv6,
             dns_cache,
         }))

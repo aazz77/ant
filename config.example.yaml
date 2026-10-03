@@ -29,6 +29,9 @@ dns:
   #   tls://1.1.1.1:853
   #   https://1.1.1.1/dns-query
   #   https://cloudflare-dns.com/dns-query
+  # default-nameserver: bootstrap 上游。必须纯 IP（不允许域名），
+  # 仅用于解析其他 nameserver 与节点 server 的域名；启动时不联网，
+  # 解析发生在实际使用点，失败只影响当次查询/拨号并自动重试。
   default-nameserver: "223.5.5.5:53"
   direct-nameserver: "223.5.5.5:53"
   proxy-nameserver: "https://1.1.1.1/dns-query"
