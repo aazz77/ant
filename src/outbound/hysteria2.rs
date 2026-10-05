@@ -79,7 +79,12 @@ struct AuthInfo {
 
 pub struct Hysteria2Outbound {
     opts: HystOption,
-    endpoint: Endpoint,
+    /// QUIC client config (TLS + transport). Endpoint is created lazily in
+    /// `connect_once` so the underlying UDP socket is bound only when a real
+    /// dial happens — critical on Android where an endpoint created at
+    /// outbound-init time can sit on a dead socket (no network yet / interface
+    /// change). Matches reflex `new_connection` behaviour.
+    client_config: ClientConfig,
     state: tokio::sync::Mutex<ConnState>,
     next_session_id: AtomicU32,
 }
@@ -91,6 +96,11 @@ struct ConnState {
 
 struct Hy2Conn {
     quic: Connection,
+    /// Keep the Endpoint (and its UDP socket / driver) alive for the life of
+    /// this connection. Quinn connections hold an Arc to endpoint internals,
+    /// but pinning the Endpoint here makes the ownership explicit and matches
+    /// the "one endpoint per connection" lifecycle used by reflex.
+    _endpoint: Endpoint,
     support_udp: bool,
     /// session_id → per-session inbound channel + fragment reassembler.
     ///
@@ -143,18 +153,9 @@ impl Hysteria2Outbound {
 
         let client_config = build_quic_config(&opts)?;
 
-        let udp = crate::app::sockopt::bind_udp("0.0.0.0:0".parse()?).await?;
-        let mut endpoint = Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            udp.into_std()?,
-            std::sync::Arc::new(quinn::TokioRuntime),
-        )?;
-        endpoint.set_default_client_config(client_config);
-
         Ok(Self {
             opts,
-            endpoint,
+            client_config,
             state: tokio::sync::Mutex::new(ConnState {
                 conn: None,
                 last_fail: None,
@@ -207,8 +208,27 @@ impl Hysteria2Outbound {
             self.opts.alpn
         );
 
-        let connecting = self
-            .endpoint
+        // Bind a fresh UDP socket + Endpoint per connection attempt (reflex-
+        // style). Address family follows the resolved server so we don't mix
+        // IPv4 endpoint with IPv6 peer on dual-stack Android networks.
+        let bind: SocketAddr = if server_addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
+        let udp = crate::app::sockopt::bind_udp(bind)
+            .await
+            .context("hy2 endpoint bind")?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            udp.into_std()?,
+            std::sync::Arc::new(quinn::TokioRuntime),
+        )
+        .context("hy2 endpoint create")?;
+        endpoint.set_default_client_config(self.client_config.clone());
+
+        let connecting = endpoint
             .connect(server_addr, &self.opts.sni)
             .context("quic connect start")?;
 
@@ -242,7 +262,10 @@ impl Hysteria2Outbound {
             });
         }
 
-        let auth = self.auth(&quic).await?;
+        let auth = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.auth(&quic))
+            .await
+            .map_err(|_| anyhow!("hy2 auth timeout ({}s)", HANDSHAKE_TIMEOUT.as_secs()))?
+            .context("hy2 auth")?;
         tracing::info!(
             "hysteria2 authenticated (status={HYSTERIA_STATUS_OK}, udp={}, tx_bps={})",
             auth.udp_enabled,
@@ -256,6 +279,7 @@ impl Hysteria2Outbound {
 
         let conn = Arc::new(Hy2Conn {
             quic: quic.clone(),
+            _endpoint: endpoint,
             support_udp: auth.udp_enabled,
             sessions: DashMap::new(),
             udp_mtu: mtu,
