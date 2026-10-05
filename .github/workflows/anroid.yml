@@ -85,14 +85,7 @@ jobs:
             build \
             --release \
             --locked \
-            --bin ant
-
-      - name: Collect binary (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          BIN="target/${{ matrix.target }}/release/ant"
-          mkdir -p dist
-          cp "$BIN" "dist/ant-android-arm64
+            --bin ant-android-aarch64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -100,4 +93,4 @@ jobs:
           tag_name: bin
           prerelease: false
           files: |
-            dist/*
+            target/${{ matrix.target }}/release/ant-*
