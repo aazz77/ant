@@ -85,7 +85,7 @@ jobs:
             build \
             --release \
             --locked \
-            --bin ant-android-aarch64
+            --bin ant
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -93,4 +93,4 @@ jobs:
           tag_name: bin
           prerelease: false
           files: |
-            target/${{ matrix.target }}/release/ant-*
+            target/${{ matrix.target }}/release/ant
